@@ -3,10 +3,18 @@
 #include "llama.h"
 #include <vector>
 
+// Lookahead generation statistics for importance scoring
+struct llama_lookahead_stat {
+    float max_logit;    // Maximum logit value (prediction confidence)
+    float entropy;      // Entropy of logit distribution (uncertainty)
+    int position;       // Position in sequence
+};
+
 // Speculative Prefill Context
 struct llama_spec_prefill_context {
     llama_context * ctx_base;  // Base model context
     llama_context * ctx_spec;  // Speculative (smaller) model context
+    std::vector<llama_lookahead_stat> lookahead_stats;  // Statistics from lookahead generation
 };
 
 // Initialize speculative prefill context

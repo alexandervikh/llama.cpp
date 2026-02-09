@@ -269,3 +269,13 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 unset(LLAMA_TEST_NAME)
 llama_build(test-spec-prefill.cpp)
 target_include_directories(test-spec-prefill PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+# Speculative prefill benchmark
+unset(LLAMA_TEST_NAME)
+llama_build(test-spec-prefill-bench.cpp)
+target_include_directories(test-spec-prefill-bench PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+# Importance scoring debug test
+unset(LLAMA_TEST_NAME)
+llama_build(test-importance-debug.cpp)
+target_include_directories(test-importance-debug PRIVATE ${PROJECT_SOURCE_DIR}/include)
