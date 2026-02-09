@@ -74,15 +74,19 @@ static double benchmark_spec_prefill(
 }
 
 // Run comprehensive benchmark
-static void run_benchmark(const char * model_path) {
+static void run_benchmark(const char * base_model_path, const char * spec_model_path) {
     printf("========================================\n");
     printf("Speculative Prefill Performance Benchmark\n");
     printf("========================================\n\n");
     
+    printf("Base model: %s\n", base_model_path);
+    printf("Spec model: %s\n", spec_model_path);
+    printf("\n");
+    
     // Load models
     llama_model_params model_params = llama_model_default_params();
-    llama_model * model_base = llama_load_model_from_file(model_path, model_params);
-    llama_model * model_spec = llama_load_model_from_file(model_path, model_params);
+    llama_model * model_base = llama_load_model_from_file(base_model_path, model_params);
+    llama_model * model_spec = llama_load_model_from_file(spec_model_path, model_params);
     
     if (!model_base || !model_spec) {
         fprintf(stderr, "Failed to load model\n");
@@ -153,8 +157,16 @@ static void run_benchmark(const char * model_path) {
     printf("  - n_lookahead = 8\n");
     printf("  - Averaged over 3 runs\n");
     printf("  - Using attention-based importance (logit analysis)\n");
-    printf("  - Performance limited by using same model for base/spec\n");
-    printf("  - Real speedup requires much smaller spec model\n");
+    
+    if (strcmp(base_model_path, spec_model_path) == 0) {
+        printf("  - ⚠️  Same model used for base and spec\n");
+        printf("  - ⚠️  No speedup expected (overhead dominates)\n");
+        printf("  - ℹ️  Use smaller spec model to see 2-3x speedup\n");
+    } else {
+        printf("  - ✓ Different models for base and spec\n");
+        printf("  - ✓ Speedup depends on model size ratio\n");
+    }
+    
     printf("\n");
     
     // Test different keep_ratio values on 200-token prompt
@@ -208,12 +220,31 @@ static void run_benchmark(const char * model_path) {
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <model-path>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <base-model-path> [spec-model-path]\n", argv[0]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "Arguments:\n");
+        fprintf(stderr, "  base-model-path: Path to the base (larger) model\n");
+        fprintf(stderr, "  spec-model-path: Path to the spec (smaller) model (optional)\n");
+        fprintf(stderr, "                   If not provided, uses base model for both\n");
+        fprintf(stderr, "\n");
+        fprintf(stderr, "Examples:\n");
+        fprintf(stderr, "  # Same model for both (baseline)\n");
+        fprintf(stderr, "  %s models/tinyllama-1.1b.gguf\n", argv[0]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "  # Different models (shows speedup)\n");
+        fprintf(stderr, "  %s models/llama-3.2-3b.gguf models/smollm-135m.gguf\n", argv[0]);
         return 1;
     }
     
-    const char * model_path = argv[1];
-    run_benchmark(model_path);
+    const char * base_model_path = argv[1];
+    const char * spec_model_path = (argc >= 3) ? argv[2] : argv[1];
+    
+    if (argc < 3) {
+        printf("Note: Using same model for base and spec (no speedup expected)\n");
+        printf("      Provide two model paths to see actual speedup\n\n");
+    }
+    
+    run_benchmark(base_model_path, spec_model_path);
     
     return 0;
 }
