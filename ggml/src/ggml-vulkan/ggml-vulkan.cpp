@@ -3246,7 +3246,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             wg_size = (rows_cols[1] / 16) * device->subgroup_size; // enough subgroups for Bc/MatBc
             break;
         case FA_VECTOR:
-            wg_size = 128;
+            wg_size = device->vendor_id == VK_VENDOR_ID_AMD ? 256 : 128;
             break;
         default:
             if (device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -3264,7 +3264,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
         const uint32_t D_lsb = D ^ (D & (D-1));
         uint32_t D_split;
         if (path == FA_VECTOR) {
-            D_split = std::min(std::min(device->subgroup_size, 8u), D_lsb / 4);
+            uint32_t max_d_split;
+
+            switch(device->vendor_id) {
+            case VK_VENDOR_ID_AMD:
+                max_d_split = device->architecture == AMD_GCN ? 32u : 16u;
+                break;
+            default:
+                max_d_split = 32u;
+            }
+
+            D_split = std::min(std::min(device->subgroup_size, max_d_split), D_lsb / 4);
         } else {
             D_split = std::min(std::min(device->subgroup_size, 8u), D_lsb / 4);
         }
