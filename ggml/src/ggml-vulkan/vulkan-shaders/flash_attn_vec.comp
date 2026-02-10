@@ -111,6 +111,7 @@ void main() {
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
+    const bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
     [[dont_unroll]]
     for (uint32_t j = start_j + (gl_SubgroupID % subgroups_per_row); j < end_j; j += subgroups_per_row) {
@@ -179,10 +180,13 @@ void main() {
 
         if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
             const uint32_t kv_pos = j * Bc + group_id * D_split + d_tid;
-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                FLOAT_TYPE mvf = FLOAT_TYPE(data_m[m_offset + tile_row(r) * m_stride + kv_pos]);
-
-                Sf[r] += slope[r]*mvf;
+            if (!KV_bounds_check || kv_pos < KV) {
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    if (!nem1_bounds_check || i * Br + tile_row(r) < p.nem1) {
+                        FLOAT_TYPE mvf = FLOAT_TYPE(data_m[m_offset + tile_row(r) * m_stride + kv_pos]);
+                        Sf[r] += slope[r]*mvf;
+                    }
+                }
             }
         }
 
