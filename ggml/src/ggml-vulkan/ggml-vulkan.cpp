@@ -2783,7 +2783,7 @@ static uint32_t get_fa_scalar_num_rows(uint32_t hsk, uint32_t hsv, FaRows rows, 
         return 1;
     }
 
-    if (hsv >= 192 || (hsv | hsk) & 8 || small_cache) {
+    if (hsv >= 192 || (hsv | hsk) & 8 || small_cache || rows == FA_ROWS_2 || rows == FA_ROWS_4 || rows == FA_ROWS_8) {
         return 8;
     }
 
