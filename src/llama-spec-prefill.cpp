@@ -9,6 +9,15 @@ llama_spec_prefill_context * llama_spec_prefill_init(
     llama_context * ctx_base,
     llama_context * ctx_spec
 ) {
+    llama_spec_prefill_params default_params;
+    return llama_spec_prefill_init_with_params(ctx_base, ctx_spec, default_params);
+}
+
+llama_spec_prefill_context * llama_spec_prefill_init_with_params(
+    llama_context * ctx_base,
+    llama_context * ctx_spec,
+    const llama_spec_prefill_params & params
+) {
     if (!ctx_base || !ctx_spec) {
         fprintf(stderr, "%s: invalid context pointers\n", __func__);
         return nullptr;
@@ -18,6 +27,18 @@ llama_spec_prefill_context * llama_spec_prefill_init(
     ctx->ctx_base = ctx_base;
     ctx->ctx_spec = ctx_spec;
     ctx->lookahead_stats.clear();
+    ctx->params = params;
+    ctx->actual_lookahead_cnt = 0;
+    
+    // Initialize default EOS tokens if not provided
+    if (ctx->params.eos_tokens.empty()) {
+        const llama_model * model = llama_get_model(ctx_spec);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        llama_token eos = llama_vocab_eos(vocab);
+        if (eos != LLAMA_TOKEN_NULL) {
+            ctx->params.eos_tokens.push_back(eos);
+        }
+    }
 
     return ctx;
 }
@@ -71,6 +92,7 @@ int llama_spec_prefill_generate_lookahead(
     int n_generated = 0;
     llama_token token = prompt_tokens[n_prompt - 1];
     ctx->lookahead_stats.resize(n_lookahead);
+    ctx->actual_lookahead_cnt = n_lookahead;
 
     for (int i = 0; i < n_lookahead; i++) {
         float * logits = llama_get_logits_ith(ctx->ctx_spec, batch.n_tokens - 1);
@@ -106,6 +128,21 @@ int llama_spec_prefill_generate_lookahead(
 
         lookahead_tokens[i] = next_token;
         n_generated++;
+        
+        // Check for EOS token (like vLLM's _get_actual_look_ahead_cnts)
+        if (!ctx->params.ignore_eos) {
+            bool is_eos = false;
+            for (llama_token eos : ctx->params.eos_tokens) {
+                if (next_token == eos) {
+                    is_eos = true;
+                    break;
+                }
+            }
+            if (is_eos) {
+                ctx->actual_lookahead_cnt = i + 1;
+                break;
+            }
+        }
 
         // Prepare next batch
         batch.n_tokens = 0;
@@ -167,6 +204,38 @@ int llama_spec_prefill_compute_attention(
     // Each lookahead position's entropy/confidence reflects how well
     // the prompt tokens "attended" to it
     return 0;
+}
+
+// Apply average pooling to smooth importance scores (like vLLM's avg_pool1d)
+void llama_spec_prefill_apply_pooling(
+    std::vector<float> & importance,
+    int kernel_size
+) {
+    if (kernel_size <= 1 || importance.empty()) {
+        return;
+    }
+    
+    int n = (int)importance.size();
+    int half_kernel = kernel_size / 2;
+    std::vector<float> smoothed(n);
+    
+    for (int i = 0; i < n; i++) {
+        float sum = 0.0f;
+        int count = 0;
+        
+        // Window centered at position i
+        int start = std::max(0, i - half_kernel);
+        int end = std::min(n - 1, i + half_kernel);
+        
+        for (int j = start; j <= end; j++) {
+            sum += importance[j];
+            count++;
+        }
+        
+        smoothed[i] = sum / count;
+    }
+    
+    importance = smoothed;
 }
 
 int llama_spec_prefill_compute_importance(
@@ -261,6 +330,11 @@ int llama_spec_prefill_compute_importance(
             token_importance[i] = 0.1f + 0.9f * normalized;
         }
     }
+    
+    // 4. Apply smoothing/pooling if configured (like vLLM's avg_pool1d)
+    if (ctx->params.pool_kernel_size > 1) {
+        llama_spec_prefill_apply_pooling(token_importance, ctx->params.pool_kernel_size);
+    }
 
     return 0;
 }
@@ -325,6 +399,93 @@ int llama_spec_prefill_filter_tokens(
     return 0;
 }
 
+int llama_spec_prefill_filter_tokens_chunked(
+    llama_spec_prefill_context * ctx,
+    const llama_token * prompt_tokens,
+    const int * prompt_positions,
+    int n_prompt,
+    const std::vector<float> & token_importance,
+    float keep_ratio,
+    int chunk_size,
+    std::vector<llama_token> & filtered_tokens,
+    std::vector<int> & filtered_positions
+) {
+    // Chunk-based selection like vLLM's _get_kept_indices_from_token_importance
+    // 1. Split tokens into chunks
+    // 2. Compute average importance per chunk
+    // 3. Keep top-k chunks
+    // 4. Include all tokens from kept chunks
+    
+    if (!ctx || !prompt_tokens || !prompt_positions || n_prompt <= 0) {
+        return -1;
+    }
+    
+    if (token_importance.size() != (size_t)n_prompt) {
+        return -1;
+    }
+    
+    if (chunk_size <= 0) {
+        chunk_size = 32;  // Default like vLLM
+    }
+    
+    // Calculate number of chunks
+    int n_chunks = (n_prompt + chunk_size - 1) / chunk_size;
+    
+    // Compute average importance for each chunk
+    std::vector<std::pair<float, int>> chunk_importance;
+    chunk_importance.reserve(n_chunks);
+    
+    for (int c = 0; c < n_chunks; c++) {
+        int start = c * chunk_size;
+        int end = std::min(start + chunk_size, n_prompt);
+        
+        float avg = 0.0f;
+        for (int i = start; i < end; i++) {
+            avg += token_importance[i];
+        }
+        avg /= (end - start);
+        
+        chunk_importance.push_back({avg, c});
+    }
+    
+    // Sort chunks by importance (descending)
+    std::sort(chunk_importance.begin(), chunk_importance.end(),
+        [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+            return a.first > b.first;
+        });
+    
+    // Calculate how many chunks to keep
+    int n_keep_chunks = (int)std::ceil(n_chunks * keep_ratio);
+    if (n_keep_chunks < 1) n_keep_chunks = 1;
+    if (n_keep_chunks > n_chunks) n_keep_chunks = n_chunks;
+    
+    // Get indices of chunks to keep
+    std::vector<int> kept_chunk_indices;
+    kept_chunk_indices.reserve(n_keep_chunks);
+    for (int i = 0; i < n_keep_chunks; i++) {
+        kept_chunk_indices.push_back(chunk_importance[i].second);
+    }
+    
+    // Sort chunk indices to maintain order
+    std::sort(kept_chunk_indices.begin(), kept_chunk_indices.end());
+    
+    // Collect all tokens from kept chunks
+    filtered_tokens.clear();
+    filtered_positions.clear();
+    
+    for (int c : kept_chunk_indices) {
+        int start = c * chunk_size;
+        int end = std::min(start + chunk_size, n_prompt);
+        
+        for (int i = start; i < end; i++) {
+            filtered_tokens.push_back(prompt_tokens[i]);
+            filtered_positions.push_back(prompt_positions[i]);
+        }
+    }
+
+    return 0;
+}
+
 int llama_spec_prefill_process_base(
     llama_spec_prefill_context * ctx,
     const llama_token * filtered_tokens,
@@ -369,11 +530,15 @@ int llama_spec_prefill(
     if (!ctx || !prompt_tokens || n_prompt <= 0 || n_lookahead <= 0) {
         return -1;
     }
+    
+    // Use parameters from context if available, otherwise use provided values
+    int actual_lookahead = (n_lookahead > 0) ? n_lookahead : ctx->params.n_lookahead;
+    float actual_keep_ratio = (keep_ratio > 0) ? keep_ratio : ctx->params.keep_ratio;
 
     // Step 1: Generate lookahead tokens
-    std::vector<llama_token> lookahead_tokens(n_lookahead);
+    std::vector<llama_token> lookahead_tokens(actual_lookahead);
     int n_generated = llama_spec_prefill_generate_lookahead(
-        ctx, prompt_tokens, n_prompt, lookahead_tokens.data(), n_lookahead
+        ctx, prompt_tokens, n_prompt, lookahead_tokens.data(), actual_lookahead
     );
     if (n_generated <= 0) {
         return -1;
@@ -390,13 +555,13 @@ int llama_spec_prefill(
         return -1;
     }
 
-    // Step 4: Compute token importance
+    // Step 4: Compute token importance (with pooling applied inside)
     std::vector<float> token_importance;
     if (llama_spec_prefill_compute_importance(ctx, prompt_tokens, n_prompt, token_importance) != 0) {
         return -1;
     }
 
-    // Step 5: Filter tokens
+    // Step 5: Filter tokens (choose chunked or token-based)
     std::vector<int> prompt_positions(n_prompt);
     for (int i = 0; i < n_prompt; i++) {
         prompt_positions[i] = i;
@@ -404,11 +569,23 @@ int llama_spec_prefill(
 
     std::vector<llama_token> filtered_tokens;
     std::vector<int> filtered_positions;
-    if (llama_spec_prefill_filter_tokens(
-            ctx, prompt_tokens, prompt_positions.data(), n_prompt,
-            token_importance, keep_ratio,
-            filtered_tokens, filtered_positions) != 0) {
-        return -1;
+    
+    if (ctx->params.use_chunking) {
+        // Chunk-based selection like vLLM
+        if (llama_spec_prefill_filter_tokens_chunked(
+                ctx, prompt_tokens, prompt_positions.data(), n_prompt,
+                token_importance, actual_keep_ratio, ctx->params.chunk_size,
+                filtered_tokens, filtered_positions) != 0) {
+            return -1;
+        }
+    } else {
+        // Token-based selection
+        if (llama_spec_prefill_filter_tokens(
+                ctx, prompt_tokens, prompt_positions.data(), n_prompt,
+                token_importance, actual_keep_ratio,
+                filtered_tokens, filtered_positions) != 0) {
+            return -1;
+        }
     }
 
     // Step 6: Process with base model
