@@ -1433,6 +1433,7 @@ private:
 
         res->n_decoded           = slot.n_decoded;
         res->n_prompt_tokens     = slot.task->n_tokens();
+        res->n_thinking_tokens   = slot.n_thinking_tokens;
         res->post_sampling_probs = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -1482,6 +1483,7 @@ private:
         res->n_decoded           = slot.n_decoded;
         res->n_prompt_tokens     = slot.task->n_tokens();
         res->n_tokens_cached     = slot.prompt.n_tokens();
+        res->n_thinking_tokens   = slot.n_thinking_tokens;
         res->has_new_line        = slot.has_new_line;
         res->stopping_word       = slot.stopping_word;
         res->stop                = slot.stop;
