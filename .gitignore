@@ -138,3 +138,12 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Speculative prefill docs and tools
+/MODEL_SETUP_GUIDE.md
+/QUICK_START_SPEEDUP.md
+/SPEC_PREFILL_IMPLEMENTATION.md
+/SPEC_PREFILL_PLAN.md
+/SPEC_PREFILL_STATUS.md
+/scripts/download-spec-prefill-models.sh
+tests/speculative_prefill.code-workspace

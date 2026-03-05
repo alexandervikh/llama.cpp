@@ -1438,16 +1438,22 @@ private:
         // For GPT-OSS and similar models that use reasoning_content field in streaming mode
         if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty()) {
             try {
+                SRV_DBG("Attempting to parse reasoning_content in streaming mode (length=%zu)\n", slot.generated_text.size());
                 task_result_state temp_state(slot.task->params.chat_parser_params);
                 std::vector<common_chat_msg_diff> temp_diffs;
                 common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, true, temp_diffs);
                 
+                SRV_DBG("Parsed reasoning_content length=%zu in streaming mode\n", parsed_msg.reasoning_content.size());
+                
                 if (!parsed_msg.reasoning_content.empty()) {
                     llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
                     res->n_thinking_tokens = reasoning_tokens.size();
+                    SRV_DBG("Set n_thinking_tokens to %d from reasoning_content in streaming mode\n", res->n_thinking_tokens);
                 }
+            } catch (const std::exception & e) {
+                SRV_DBG("Exception parsing reasoning_content in streaming: %s\n", e.what());
             } catch (...) {
-                // If parsing fails, keep n_thinking_tokens as is
+                SRV_WRN("%s\n", "Unknown exception parsing reasoning_content in streaming");
             }
         }
 
@@ -1504,19 +1510,26 @@ private:
 
         // For GPT-OSS and similar models that use reasoning_content field,
         // parse the message and count reasoning tokens if inline tracking didn't capture them
-        if (res->n_thinking_tokens == 0 && !slot.generated_text.empty()) {
+        if (res->n_thinking_tokens == 0 && !res->content.empty()) {
             try {
+                SRV_DBG("Attempting to parse reasoning_content from response content (length=%zu)\n", res->content.size());
                 task_result_state temp_state(slot.task->params.chat_parser_params);
                 std::vector<common_chat_msg_diff> temp_diffs;
-                common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, false, temp_diffs);
+                common_chat_msg parsed_msg = temp_state.update_chat_msg(res->content, false, temp_diffs);
+                
+                SRV_DBG("Parsed reasoning_content length=%zu, content length=%zu\n", 
+                        parsed_msg.reasoning_content.size(), parsed_msg.content.size());
                 
                 if (!parsed_msg.reasoning_content.empty()) {
                     // Tokenize the reasoning_content to get accurate token count
                     llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
                     res->n_thinking_tokens = reasoning_tokens.size();
+                    SRV_DBG("Set n_thinking_tokens to %d from reasoning_content\n", res->n_thinking_tokens);
                 }
+            } catch (const std::exception & e) {
+                SRV_DBG("Exception parsing reasoning_content: %s\n", e.what());
             } catch (...) {
-                // If parsing fails, keep n_thinking_tokens as 0
+                SRV_WRN("%s\n", "Unknown exception parsing reasoning_content");
             }
         }
 
