@@ -644,7 +644,8 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"usage", json {
             {"completion_tokens", n_decoded},
             {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+            {"reasoning_tokens",  n_thinking_tokens}
         }},
         {"id", oaicompat_cmpl_id}
     };
@@ -696,7 +697,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"usage", json {
             {"completion_tokens", n_decoded},
             {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+            {"reasoning_tokens",  n_thinking_tokens}
         }},
         {"id", oaicompat_cmpl_id}
     };
