@@ -2808,10 +2808,17 @@ private:
                 // --- thinking budget enforcement ---
                 {
                     const int32_t reasoning_budget = params_base.reasoning_budget;
+                    const std::string & open_tag    = slot.task->params.chat_parser_params.thinking_open_tag;
                     const std::string & close_tag   = slot.task->params.chat_parser_params.thinking_close_tag;
                     if (reasoning_budget > 0 && !close_tag.empty()) {
                         const std::string candidate = slot.generated_text + result.text_to_send;
-                        if (slot.in_thinking_block) {
+                        if (!slot.in_thinking_block) {
+                            // detect entry into thinking block for models that generate the open tag themselves
+                            if (!open_tag.empty() && string_ends_with(candidate, open_tag)) {
+                                slot.in_thinking_block = true;
+                                slot.n_thinking_tokens = 0;
+                            }
+                        } else {
                             slot.n_thinking_tokens++;
                             if (string_ends_with(candidate, close_tag)) {
                                 // the model closed the thinking block naturally

@@ -345,6 +345,7 @@ task_params server_task::params_from_json_cmpl(
         params.chat_parser_params.reasoning_format = reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
         params.chat_parser_params.thinking_forced_open = json_value(data, "thinking_forced_open", false);
+        params.chat_parser_params.thinking_open_tag    = json_value(data, "thinking_open_tag",  std::string(""));
         params.chat_parser_params.thinking_close_tag   = json_value(data, "thinking_close_tag", std::string(""));
         params.chat_parser_params.parse_tool_calls = json_value(data, "parse_tool_calls", false);
         if (data.contains("chat_parser")) {
