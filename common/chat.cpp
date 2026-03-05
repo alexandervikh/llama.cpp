@@ -2162,6 +2162,10 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
         });
     }
 
+    // Enable inline reasoning token tracking for the analysis channel
+    data.thinking_open_tag = "<|channel|>analysis<|message|>";
+    data.thinking_close_tag = "<|end|>";
+
     return data;
 }
 
