@@ -1434,6 +1434,23 @@ private:
         res->n_decoded           = slot.n_decoded;
         res->n_prompt_tokens     = slot.task->n_tokens();
         res->n_thinking_tokens   = slot.n_thinking_tokens;
+
+        // For GPT-OSS and similar models that use reasoning_content field in streaming mode
+        if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty()) {
+            try {
+                task_result_state temp_state;
+                std::vector<common_chat_msg_diff> temp_diffs;
+                common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, true, temp_diffs);
+                
+                if (!parsed_msg.reasoning_content.empty()) {
+                    llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
+                    res->n_thinking_tokens = reasoning_tokens.size();
+                }
+            } catch (...) {
+                // If parsing fails, keep n_thinking_tokens as is
+            }
+        }
+
         res->post_sampling_probs = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -1484,6 +1501,25 @@ private:
         res->n_prompt_tokens     = slot.task->n_tokens();
         res->n_tokens_cached     = slot.prompt.n_tokens();
         res->n_thinking_tokens   = slot.n_thinking_tokens;
+
+        // For GPT-OSS and similar models that use reasoning_content field,
+        // parse the message and count reasoning tokens if inline tracking didn't capture them
+        if (res->n_thinking_tokens == 0 && !slot.generated_text.empty()) {
+            try {
+                task_result_state temp_state;
+                std::vector<common_chat_msg_diff> temp_diffs;
+                common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, false, temp_diffs);
+                
+                if (!parsed_msg.reasoning_content.empty()) {
+                    // Tokenize the reasoning_content to get accurate token count
+                    llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
+                    res->n_thinking_tokens = reasoning_tokens.size();
+                }
+            } catch (...) {
+                // If parsing fails, keep n_thinking_tokens as 0
+            }
+        }
+
         res->has_new_line        = slot.has_new_line;
         res->stopping_word       = slot.stopping_word;
         res->stop                = slot.stop;
