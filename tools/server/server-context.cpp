@@ -1486,7 +1486,7 @@ private:
         // For GPT-OSS and similar models that use reasoning_content field in streaming mode
         if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty()) {
             try {
-                task_result_state temp_state;
+                task_result_state temp_state(slot.task->params.chat_parser_params);
                 std::vector<common_chat_msg_diff> temp_diffs;
                 common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, true, temp_diffs);
                 
@@ -1548,7 +1548,7 @@ private:
         // parse the message and count reasoning tokens if inline tracking didn't capture them
         if (res->n_thinking_tokens == 0 && !slot.generated_text.empty()) {
             try {
-                task_result_state temp_state;
+                task_result_state temp_state(slot.task->params.chat_parser_params);
                 std::vector<common_chat_msg_diff> temp_diffs;
                 common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, false, temp_diffs);
                 
