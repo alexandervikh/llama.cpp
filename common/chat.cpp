@@ -1212,6 +1212,7 @@ static common_chat_params common_chat_params_init_command_r7b(const common_chat_
             data.prompt += "<|END_THINKING|>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<|START_THINKING|>";
             data.thinking_close_tag   = "<|END_THINKING|>";
         }
     } else if (!inputs.enable_thinking && string_ends_with(data.prompt, "<|CHATBOT_TOKEN|>")) {
@@ -1382,6 +1383,7 @@ static common_chat_params common_chat_params_init_nemotron_v2(const common_chat_
             data.prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -1443,6 +1445,7 @@ static common_chat_params common_chat_params_init_nemotron_v3(const common_chat_
             data.prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -1562,6 +1565,7 @@ static common_chat_params common_chat_params_init_apertus(const common_chat_temp
             data.prompt += "<|inner_suffix|>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<|inner_prefix|>";
             data.thinking_close_tag   = "<|inner_suffix|>";
         }
     }
@@ -1647,6 +1651,7 @@ static common_chat_params common_chat_params_init_deepseek_r1(const common_chat_
             data.prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -1713,6 +1718,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_1(const common_cha
             data.prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -1774,6 +1780,7 @@ static common_chat_params common_chat_params_init_minimax_m2(const common_chat_t
         } else {
             // Mark thinking as forced open (template started with <think>)
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -2110,6 +2117,7 @@ static common_chat_params common_chat_params_init_glm_4_5(const common_chat_temp
             prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -2344,7 +2352,15 @@ static common_chat_params common_chat_params_init_hermes_2_pro(const common_chat
             data.prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
+        }
+    } else if (inputs.enable_thinking && data.thinking_close_tag.empty()) {
+        // For templates that generate <think> themselves (e.g., Qwen3 with no tools)
+        const auto & src = tmpl.source();
+        if (src.find("<think>") != std::string::npos && src.find("</think>") != std::string::npos) {
+            data.thinking_open_tag  = "<think>";
+            data.thinking_close_tag = "</think>";
         }
     }
 
@@ -2462,6 +2478,7 @@ static common_chat_params common_chat_params_init_granite(const common_chat_temp
             data.prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -2676,6 +2693,7 @@ static common_chat_params common_chat_params_init_exaone_moe(const common_chat_t
             data.prompt += "</think>\n\n";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<think>";
             data.thinking_close_tag   = "</think>";
         }
     }
@@ -2784,6 +2802,14 @@ static common_chat_params common_chat_params_init_without_tools(const common_cha
     } else {
         data.grammar = inputs.grammar;
     }
+    // Detect thinking tags from template source (e.g. Qwen3, which generates <think> itself)
+    if (inputs.enable_thinking && data.thinking_close_tag.empty()) {
+        const auto & src = tmpl.source();
+        if (src.find("<think>") != std::string::npos && src.find("</think>") != std::string::npos) {
+            data.thinking_open_tag  = "<think>";
+            data.thinking_close_tag = "</think>";
+        }
+    }
     return data;
 }
 
@@ -2800,6 +2826,7 @@ static common_chat_params common_chat_params_init_seed_oss(
             data.prompt += "</seed:think>";
         } else {
             data.thinking_forced_open = true;
+            data.thinking_open_tag    = "<seed:think>";
             data.thinking_close_tag   = "</seed:think>";
         }
     }
