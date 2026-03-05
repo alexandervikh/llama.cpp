@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../../speculative_prefill/speculative_prefill"
+		},
+		{
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

@@ -158,6 +158,7 @@ struct common_chat_params {
     std::string                         grammar;
     bool                                grammar_lazy = false;
     bool                                thinking_forced_open = false;
+    std::string                         thinking_close_tag;   // close tag to inject when thinking budget is exceeded, e.g. "</think>"
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
@@ -170,8 +171,16 @@ struct common_chat_syntax {
     // Whether reasoning_content should be inlined in the content (e.g. for reasoning_format=deepseek in stream mode)
     bool                     reasoning_in_content  = false;
     bool                     thinking_forced_open  = false;
+    std::string              thinking_close_tag;           // close tag string, e.g. "</think>"
     bool                     parse_tool_calls      = true;
     common_peg_arena         parser                = {};
+    
+    common_chat_syntax() = default;
+    common_chat_syntax(const common_chat_params & chat_params) {
+        format               = chat_params.format;
+        thinking_forced_open = chat_params.thinking_forced_open;
+        thinking_close_tag   = chat_params.thinking_close_tag;
+    }
 };
 
 // Check if the template supplied via "--chat-template" is supported or not. Returns true if it's valid

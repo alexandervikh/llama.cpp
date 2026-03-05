@@ -113,6 +113,11 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
 
+    // thinking budget tracking
+    int32_t                  n_thinking_tokens = 0;   // tokens emitted inside current thinking block
+    bool                     in_thinking_block = false;
+    std::vector<llama_token> forced_tokens;            // queue of tokens to forcibly inject (e.g. close tag)
+
     stop_type stop;
 
     std::string stopping_word;
@@ -191,6 +196,10 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
+        n_thinking_tokens = 0;
+        in_thinking_block = false;
+        forced_tokens.clear();
 
         // clear speculative decoding stats
         n_draft_total = 0;
@@ -1222,6 +1231,13 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // if thinking block is already open in the prompt, start counting immediately
+        if (slot.task->params.oaicompat_chat_syntax.thinking_forced_open &&
+                !slot.task->params.oaicompat_chat_syntax.thinking_close_tag.empty()) {
+            slot.in_thinking_block = true;
+            slot.n_thinking_tokens = 0;
+        }
 
         slot.state = slot.is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2739,11 +2755,21 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                llama_token id;
+                bool token_was_forced = false;
+                if (!slot.forced_tokens.empty()) {
+                    // inject next forced token (e.g. thinking close tag) instead of sampling
+                    id = slot.forced_tokens.front();
+                    slot.forced_tokens.erase(slot.forced_tokens.begin());
+                    token_was_forced = true;
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                }
 
                 slot.i_batch = -1;
 
-                common_sampler_accept(slot.smpl.get(), id, true);
+                // accept must always be called; bypass grammar acceptance for forced tokens
+                common_sampler_accept(slot.smpl.get(), id, /* accept_grammar= */ !token_was_forced);
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
@@ -2765,6 +2791,27 @@ private:
 
                 if (slot.task->params.sampling.n_probs > 0) {
                     populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                }
+
+                // --- thinking budget enforcement ---
+                {
+                    const int32_t reasoning_budget = params_base.reasoning_budget;
+                    const std::string & close_tag   = slot.task->params.chat_parser_params.thinking_close_tag;
+                    if (reasoning_budget > 0 && !close_tag.empty()) {
+                        const std::string candidate = slot.generated_text + result.text_to_send;
+                        if (slot.in_thinking_block) {
+                            slot.n_thinking_tokens++;
+                            if (string_ends_with(candidate, close_tag)) {
+                                // the model closed the thinking block naturally
+                                slot.in_thinking_block = false;
+                            } else if (slot.n_thinking_tokens >= reasoning_budget && slot.forced_tokens.empty()) {
+                                // budget exceeded: queue close tag tokens to forcibly terminate thinking
+                                SLT_INF(slot, "reasoning budget exhausted (%d tokens), injecting close tag\n", slot.n_thinking_tokens);
+                                slot.forced_tokens = common_tokenize(ctx, close_tag, false, true);
+                                slot.in_thinking_block = false;
+                            }
+                        }
+                    }
                 }
 
                 if (!process_token(result, slot)) {
