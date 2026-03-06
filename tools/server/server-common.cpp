@@ -1063,8 +1063,13 @@ json oaicompat_chat_params_parse(
     // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
     // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
     for (const auto & item : body.items()) {
-        // Exception: if "n_predict" is present, we overwrite the value specified earlier by "max_tokens"
-        if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
+        // Exception: these params can be overridden even if set by chat template
+        const bool can_override = item.key() == "n_predict" || 
+                                  item.key() == "thinking_forced_open" ||
+                                  item.key() == "thinking_open_tag" ||
+                                  item.key() == "thinking_close_tag";
+        
+        if (!llama_params.contains(item.key()) || can_override) {
             llama_params[item.key()] = item.value();
         }
     }
