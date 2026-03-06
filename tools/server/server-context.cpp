@@ -1232,6 +1232,15 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // DEBUG: Always log thinking parameters
+        fprintf(stderr, "[REASONING-DEBUG] slot=%d thinking_forced_open=%d close_tag='%s' open_tag='%s' budget=%d\n",
+            slot.id, 
+            slot.task->params.chat_parser_params.thinking_forced_open ? 1 : 0,
+            slot.task->params.chat_parser_params.thinking_close_tag.c_str(),
+            slot.task->params.chat_parser_params.thinking_open_tag.c_str(),
+            params_base.reasoning_budget);
+        fflush(stderr);
+
         // if thinking block is already open in the prompt, start counting immediately
         if (slot.task->params.oaicompat_chat_syntax.thinking_forced_open &&
                 !slot.task->params.oaicompat_chat_syntax.thinking_close_tag.empty()) {
