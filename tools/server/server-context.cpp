@@ -1187,6 +1187,11 @@ private:
                 !slot.task->params.chat_parser_params.thinking_close_tag.empty()) {
             slot.in_thinking_block = true;
             slot.n_thinking_tokens = 0;
+            fprintf(stderr, "[REASONING-INIT] slot=%d thinking_forced_open=TRUE budget=%d close_tag='%s'\n",
+                slot.id, params_base.reasoning_budget, slot.task->params.chat_parser_params.thinking_close_tag.c_str());
+            fflush(stderr);
+            SLT_INF(slot, "REASONING: thinking_forced_open=true, in_thinking_block=true, budget=%d, close_tag='%s'\n",
+                params_base.reasoning_budget, slot.task->params.chat_parser_params.thinking_close_tag.c_str());
         }
 
         slot.state = slot.task->is_child()
@@ -1436,7 +1441,9 @@ private:
         res->n_thinking_tokens   = slot.n_thinking_tokens;
 
         // For GPT-OSS and similar models that use reasoning_content field in streaming mode
-        if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty()) {
+        // Skip post-processing if thinking_forced_open (inline tracking should have counted)
+        if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty() &&
+            !slot.task->params.chat_parser_params.thinking_forced_open) {
             try {
                 SRV_DBG("Attempting to parse reasoning_content in streaming mode (length=%zu)\n", slot.generated_text.size());
                 task_result_state temp_state(slot.task->params.chat_parser_params);
@@ -1510,7 +1517,9 @@ private:
 
         // For GPT-OSS and similar models that use reasoning_content field,
         // parse the message and count reasoning tokens if inline tracking didn't capture them
-        if (res->n_thinking_tokens == 0 && !res->content.empty()) {
+        // Skip post-processing if thinking_forced_open (inline tracking should have counted)
+        if (res->n_thinking_tokens == 0 && !res->content.empty() &&
+            !slot.task->params.chat_parser_params.thinking_forced_open) {
             try {
                 SRV_DBG("Attempting to parse reasoning_content from response content (length=%zu)\n", res->content.size());
                 task_result_state temp_state(slot.task->params.chat_parser_params);
@@ -2861,6 +2870,16 @@ private:
                     const int32_t reasoning_budget = params_base.reasoning_budget;
                     const std::string & open_tag    = slot.task->params.chat_parser_params.thinking_open_tag;
                     const std::string & close_tag   = slot.task->params.chat_parser_params.thinking_close_tag;
+                    
+                    // Log first token to verify budget is active
+                    if (slot.in_thinking_block && slot.n_thinking_tokens == 0) {
+                        fprintf(stderr, "[REASONING-START] slot=%d First token, budget=%d close_tag='%s'\n",
+                            slot.id, reasoning_budget, close_tag.c_str());
+                        fflush(stderr);
+                        SLT_INF(slot, "REASONING: First token in thinking block, budget=%d, close_tag='%s'\n",
+                            reasoning_budget, close_tag.c_str());
+                    }
+                    
                     if (reasoning_budget > 0 && !close_tag.empty()) {
                         const std::string candidate = slot.generated_text + result.text_to_send;
                         if (!slot.in_thinking_block) {
@@ -2871,12 +2890,29 @@ private:
                             }
                         } else {
                             slot.n_thinking_tokens++;
+                            
+                            // Log every 5 tokens to trace counting
+                            if (slot.n_thinking_tokens <= 5 || slot.n_thinking_tokens % 5 == 0) {
+                                fprintf(stderr, "[REASONING-COUNT] slot=%d token=%d budget=%d\n",
+                                    slot.id, slot.n_thinking_tokens, reasoning_budget);
+                                fflush(stderr);
+                                SLT_INF(slot, "REASONING: token #%d (budget=%d)\n", slot.n_thinking_tokens, reasoning_budget);
+                            }
+                            
                             if (string_ends_with(candidate, close_tag)) {
                                 // the model closed the thinking block naturally
+                                fprintf(stderr, "[REASONING-CLOSE-NATURAL] slot=%d tokens=%d\n",
+                                    slot.id, slot.n_thinking_tokens);
+                                fflush(stderr);
+                                SLT_INF(slot, "REASONING: Natural close detected at token %d\n", slot.n_thinking_tokens);
                                 slot.in_thinking_block = false;
                             } else if (slot.n_thinking_tokens >= reasoning_budget && slot.forced_tokens.empty()) {
                                 // budget exceeded: queue close tag tokens to forcibly terminate thinking
-                                SLT_INF(slot, "reasoning budget exhausted (%d tokens), injecting close tag\n", slot.n_thinking_tokens);
+                                fprintf(stderr, "[REASONING-INJECT] slot=%d tokens=%d budget=%d INJECTING CLOSE TAG\n",
+                                    slot.id, slot.n_thinking_tokens, reasoning_budget);
+                                fflush(stderr);
+                                SLT_INF(slot, "REASONING: Budget exhausted! Injecting close tag at token %d (budget=%d)\n",
+                                    slot.n_thinking_tokens, reasoning_budget);
                                 slot.forced_tokens = common_tokenize(ctx, close_tag, false, true);
                                 slot.in_thinking_block = false;
                             }
