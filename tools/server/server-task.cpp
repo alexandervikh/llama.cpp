@@ -204,7 +204,8 @@ task_params server_task::params_from_json_cmpl(
     params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
     params.return_tokens    = json_value(data,       "return_tokens",      false);
     params.return_progress  = json_value(data,       "return_progress",    false);
-    params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_tokens", defaults.n_predict));
+    auto max_tokens         = json_value(data,       "max_tokens",         defaults.n_predict);
+    params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_completion_tokens", max_tokens));
     params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
     params.n_keep           = json_value(data,       "n_keep",             defaults.n_keep);
     params.n_discard        = json_value(data,       "n_discard",          defaults.n_discard);
@@ -344,6 +345,8 @@ task_params server_task::params_from_json_cmpl(
         params.chat_parser_params.reasoning_format = reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
         params.chat_parser_params.thinking_forced_open = json_value(data, "thinking_forced_open", false);
+        params.chat_parser_params.thinking_open_tag    = json_value(data, "thinking_open_tag",  std::string(""));
+        params.chat_parser_params.thinking_close_tag   = json_value(data, "thinking_close_tag", std::string(""));
         params.chat_parser_params.parse_tool_calls = json_value(data, "parse_tool_calls", false);
         if (data.contains("chat_parser")) {
             params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
@@ -687,7 +690,8 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"usage", json {
             {"completion_tokens", n_decoded},
             {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+            {"reasoning_tokens",  n_thinking_tokens}
         }},
         {"id", oaicompat_cmpl_id}
     };
@@ -739,7 +743,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"usage", json {
             {"completion_tokens", n_decoded},
             {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+            {"reasoning_tokens",  n_thinking_tokens}
         }},
         {"id", oaicompat_cmpl_id}
     };
@@ -1899,10 +1904,9 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         return nullptr;
     }
 
-    // TODO: for some reason we can't copy server_tokens, so we have to do this workaround
     auto & cur = states.emplace_back();
     cur = {
-        /*.tokens      =*/ server_tokens(prompt.tokens.get_text_tokens(), false),
+        /*.tokens      =*/ prompt.tokens.clone(),
         /*.data        =*/ std::move(state_data),
         /*.checkpoints =*/ prompt.checkpoints,
     };

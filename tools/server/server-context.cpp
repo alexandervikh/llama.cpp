@@ -77,6 +77,7 @@ struct server_slot {
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
+    std::string  debug_generated_text;
     llama_tokens generated_tokens;
 
     // idx of draft tokens in the main batch
@@ -89,6 +90,11 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+
+    // thinking budget tracking
+    int32_t                  n_thinking_tokens = 0;   // tokens emitted inside current thinking block
+    bool                     in_thinking_block = false;
+    std::vector<llama_token> forced_tokens;            // queue of tokens to forcibly inject (e.g. close tag)
 
     stop_type stop;
 
@@ -179,6 +185,10 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
+        n_thinking_tokens = 0;
+        in_thinking_block = false;
+        forced_tokens.clear();
 
         // clear speculative decoding stats
         n_draft_total = 0;
@@ -425,7 +435,7 @@ struct server_slot {
 
             if (!only_metrics) {
                 res["prompt"] = ptask->tokens.detokenize(ctx, true);
-                res["generated"] = generated_text;
+                res["generated"] = generated_text.empty() ? debug_generated_text : generated_text;
             }
         }
 
@@ -579,6 +589,8 @@ private:
     float slot_prompt_similarity = 0.0f;
 
     std::string model_name; // name of the loaded model, to be used by API
+    std::set<std::string> model_aliases; // additional names for the model
+    std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
 
@@ -812,16 +824,18 @@ private:
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (!params_base.model_alias.empty()) {
-            // user explicitly specified model name
-            model_name = params_base.model_alias;
+            // backward compat: use first alias as model name
+            model_name = *params_base.model_alias.begin();
         } else if (!params_base.model.name.empty()) {
-            // use model name in registry format (for models in cache)
             model_name = params_base.model.name;
         } else {
             // fallback: derive model name from file name
             auto model_path = std::filesystem::path(params_base.model.path);
             model_name = model_path.filename().string();
         }
+
+        model_aliases = params_base.model_alias;
+        model_tags    = params_base.model_tags;
 
         if (!is_resume) {
             return init();
@@ -993,9 +1007,6 @@ private:
 
             // don't update the cache if the slot's context is empty
             update_cache = update_cache && tokens.size() > 0;
-
-            // TODO: mtmd does not support prompt cache
-            update_cache = update_cache && (ret->mctx == nullptr);
 
             if (update_cache) {
                 SRV_WRN("%s", "updating prompt cache\n");
@@ -1170,6 +1181,27 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // DEBUG: Always log thinking parameters
+        fprintf(stderr, "[REASONING-DEBUG] slot=%d thinking_forced_open=%d close_tag='%s' open_tag='%s' budget=%d\n",
+            slot.id, 
+            slot.task->params.chat_parser_params.thinking_forced_open ? 1 : 0,
+            slot.task->params.chat_parser_params.thinking_close_tag.c_str(),
+            slot.task->params.chat_parser_params.thinking_open_tag.c_str(),
+            params_base.reasoning_budget);
+        fflush(stderr);
+
+        // if thinking block is already open in the prompt, start counting immediately
+        if (slot.task->params.chat_parser_params.thinking_forced_open &&
+                !slot.task->params.chat_parser_params.thinking_close_tag.empty()) {
+            slot.in_thinking_block = true;
+            slot.n_thinking_tokens = 0;
+            fprintf(stderr, "[REASONING-INIT] slot=%d thinking_forced_open=TRUE budget=%d close_tag='%s'\n",
+                slot.id, params_base.reasoning_budget, slot.task->params.chat_parser_params.thinking_close_tag.c_str());
+            fflush(stderr);
+            SLT_INF(slot, "REASONING: thinking_forced_open=true, in_thinking_block=true, budget=%d, close_tag='%s'\n",
+                params_base.reasoning_budget, slot.task->params.chat_parser_params.thinking_close_tag.c_str());
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -1415,6 +1447,32 @@ private:
 
         res->n_decoded           = slot.n_decoded;
         res->n_prompt_tokens     = slot.task->n_tokens();
+        res->n_thinking_tokens   = slot.n_thinking_tokens;
+
+        // For GPT-OSS and similar models that use reasoning_content field in streaming mode
+        // Skip post-processing if thinking_forced_open (inline tracking should have counted)
+        if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty() &&
+            !slot.task->params.chat_parser_params.thinking_forced_open) {
+            try {
+                SRV_DBG("Attempting to parse reasoning_content in streaming mode (length=%zu)\n", slot.generated_text.size());
+                task_result_state temp_state(slot.task->params.chat_parser_params);
+                std::vector<common_chat_msg_diff> temp_diffs;
+                common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, true, temp_diffs);
+                
+                SRV_DBG("Parsed reasoning_content length=%zu in streaming mode\n", parsed_msg.reasoning_content.size());
+                
+                if (!parsed_msg.reasoning_content.empty()) {
+                    llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
+                    res->n_thinking_tokens = reasoning_tokens.size();
+                    SRV_DBG("Set n_thinking_tokens to %d from reasoning_content in streaming mode\n", res->n_thinking_tokens);
+                }
+            } catch (const std::exception & e) {
+                SRV_DBG("Exception parsing reasoning_content in streaming: %s\n", e.what());
+            } catch (...) {
+                SRV_WRN("%s\n", "Unknown exception parsing reasoning_content in streaming");
+            }
+        }
+
         res->post_sampling_probs = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -1441,7 +1499,13 @@ private:
         res->id      = slot.task->id;
         res->id_slot = slot.id;
 
-        res->index           = slot.task->index;
+        res->index = slot.task->index;
+
+        // keep copy of last generated text for debugging purposes
+        if (slots_debug) {
+            slot.debug_generated_text = slot.generated_text;
+        }
+
         // in stream mode, content and tokens are already in last partial chunk
         if (slot.task->params.stream) {
             res->content     = "";
@@ -1458,6 +1522,35 @@ private:
         res->n_decoded           = slot.n_decoded;
         res->n_prompt_tokens     = slot.task->n_tokens();
         res->n_tokens_cached     = slot.prompt.n_tokens();
+        res->n_thinking_tokens   = slot.n_thinking_tokens;
+
+        // For GPT-OSS and similar models that use reasoning_content field,
+        // parse the message and count reasoning tokens if inline tracking didn't capture them
+        // Skip post-processing if thinking_forced_open (inline tracking should have counted)
+        if (res->n_thinking_tokens == 0 && !res->content.empty() &&
+            !slot.task->params.chat_parser_params.thinking_forced_open) {
+            try {
+                SRV_DBG("Attempting to parse reasoning_content from response content (length=%zu)\n", res->content.size());
+                task_result_state temp_state(slot.task->params.chat_parser_params);
+                std::vector<common_chat_msg_diff> temp_diffs;
+                common_chat_msg parsed_msg = temp_state.update_chat_msg(res->content, false, temp_diffs);
+                
+                SRV_DBG("Parsed reasoning_content length=%zu, content length=%zu\n", 
+                        parsed_msg.reasoning_content.size(), parsed_msg.content.size());
+                
+                if (!parsed_msg.reasoning_content.empty()) {
+                    // Tokenize the reasoning_content to get accurate token count
+                    llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
+                    res->n_thinking_tokens = reasoning_tokens.size();
+                    SRV_DBG("Set n_thinking_tokens to %d from reasoning_content\n", res->n_thinking_tokens);
+                }
+            } catch (const std::exception & e) {
+                SRV_DBG("Exception parsing reasoning_content: %s\n", e.what());
+            } catch (...) {
+                SRV_WRN("%s\n", "Unknown exception parsing reasoning_content");
+            }
+        }
+
         res->has_new_line        = slot.has_new_line;
         res->stopping_word       = slot.stopping_word;
         res->stop                = slot.stop;
@@ -2275,15 +2368,15 @@ private:
                                 n_past = 0;
                             }
 
+                            llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+
                             // note: when n_swa == 0, the model does not use SWA, which is equivalent to a window of 1
                             const auto n_swa = std::max(1, llama_model_n_swa(model));
 
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, n_past - n_swa);
+                            const auto pos_min_thold = std::max(0, pos_next - n_swa);
 
-                            // note: disallow with mtmd contexts for now
-                            //       https://github.com/ggml-org/llama.cpp/issues/17043
-                            if (!mctx && n_past > 0 && n_past < slot.prompt.n_tokens()) {
+                            if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -2334,9 +2427,6 @@ private:
                                 }
 
                                 if (pos_min > pos_min_thold) {
-                                    // TODO: support can be added in the future when corresponding vision models get released
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
                                     // search for a context checkpoint
@@ -2357,18 +2447,20 @@ private:
                                         const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (n != checkpoint_size) {
-                                            SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, (float) checkpoint_size / 1024 / 1024);
+                                            SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
                                             do_reset = true;
                                             //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
                                         } else {
-                                            n_past = std::min(n_past, std::max(it->pos_min + 1, it->pos_max));
-                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, (float) checkpoint_size / 1024 / 1024);
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
                                         }
                                     }
 
                                     if (do_reset) {
                                         SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        pos_next = 0;
                                         n_past = 0;
                                     }
                                 }
@@ -2379,7 +2471,7 @@ private:
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_min > pos_min_thold) {
-                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_swa = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, n_swa, (float) cur.data.size() / 1024 / 1024);
+                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, (float) cur.data.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -2395,7 +2487,7 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        slot.n_prompt_tokens_cache     = n_past;
+                        slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
@@ -2513,10 +2605,6 @@ private:
                         }
                     }
 
-                    // SLT_INF(slot, "new slot.prompt.tokens: %s\n", slot.slot.prompt.tokens.str().c_str());
-
-                    SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
-
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -2529,8 +2617,6 @@ private:
                         slot.n_decoded = 0;
                         slot.i_batch   = batch.n_tokens - 1;
 
-                        SLT_INF(slot, "prompt done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
-
                         slot.init_sampler();
 
                         const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
@@ -2542,13 +2628,15 @@ private:
                         // no need to create checkpoints that are too close together
                         do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || pos_max > slot.prompt.checkpoints.back().pos_max + 64);
 
+                        // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                        //       yet processed and therefore it is not part of the checkpoint.
                         if (do_checkpoint) {
                             while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
                                 // make room for the new checkpoint, if needed
                                 const auto & cur = slot.prompt.checkpoints.front();
 
-                                SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n",
-                                        cur.pos_min, cur.pos_max, (float) cur.data.size() / 1024 / 1024);
+                                SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                        cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
 
                                 slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
                             }
@@ -2556,16 +2644,21 @@ private:
                             const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                             auto & cur = slot.prompt.checkpoints.emplace_back(server_prompt_checkpoint{
-                                /*.pos_min = */ pos_min,
-                                /*.pos_max = */ pos_max,
-                                /*.data    = */ std::vector<uint8_t>(checkpoint_size),
+                                /*.pos_min  = */ pos_min,
+                                /*.pos_max  = */ pos_max,
+                                /*.n_tokens = */ slot.prompt.n_tokens() - batch.n_tokens,
+                                /*.data     = */ std::vector<uint8_t>(checkpoint_size),
                             });
 
                             llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                            SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, size = %.3f MiB)\n",
-                                    (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min, cur.pos_max, (float) cur.data.size() / 1024 / 1024);
+                            SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                    (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
                         }
+
+                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                    } else {
+                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
                     }
                 }
 
@@ -2743,11 +2836,21 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                llama_token id;
+                bool token_was_forced = false;
+                if (!slot.forced_tokens.empty()) {
+                    // inject next forced token (e.g. thinking close tag) instead of sampling
+                    id = slot.forced_tokens.front();
+                    slot.forced_tokens.erase(slot.forced_tokens.begin());
+                    token_was_forced = true;
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                }
 
                 slot.i_batch = -1;
 
-                common_sampler_accept(slot.smpl.get(), id, true);
+                // accept must always be called; bypass grammar acceptance for forced tokens
+                common_sampler_accept(slot.smpl.get(), id, /* accept_grammar= */ !token_was_forced);
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
@@ -2769,6 +2872,61 @@ private:
 
                 if (slot.task->params.sampling.n_probs > 0) {
                     populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                }
+
+                // --- thinking budget enforcement ---
+                {
+                    const int32_t reasoning_budget = params_base.reasoning_budget;
+                    const std::string & open_tag    = slot.task->params.chat_parser_params.thinking_open_tag;
+                    const std::string & close_tag   = slot.task->params.chat_parser_params.thinking_close_tag;
+                    
+                    // Log first token to verify budget is active
+                    if (slot.in_thinking_block && slot.n_thinking_tokens == 0) {
+                        fprintf(stderr, "[REASONING-START] slot=%d First token, budget=%d close_tag='%s'\n",
+                            slot.id, reasoning_budget, close_tag.c_str());
+                        fflush(stderr);
+                        SLT_INF(slot, "REASONING: First token in thinking block, budget=%d, close_tag='%s'\n",
+                            reasoning_budget, close_tag.c_str());
+                    }
+                    
+                    if (reasoning_budget > 0 && !close_tag.empty()) {
+                        const std::string candidate = slot.generated_text + result.text_to_send;
+                        if (!slot.in_thinking_block) {
+                            // detect entry into thinking block for models that generate the open tag themselves
+                            if (!open_tag.empty() && string_ends_with(candidate, open_tag)) {
+                                slot.in_thinking_block = true;
+                                slot.n_thinking_tokens = 0;
+                            }
+                        } else {
+                            slot.n_thinking_tokens++;
+                            
+                            // Log every 5 tokens to trace counting
+                            if (slot.n_thinking_tokens <= 5 || slot.n_thinking_tokens % 5 == 0) {
+                                fprintf(stderr, "[REASONING-COUNT] slot=%d token=%d budget=%d\n",
+                                    slot.id, slot.n_thinking_tokens, reasoning_budget);
+                                fflush(stderr);
+                                SLT_INF(slot, "REASONING: token #%d (budget=%d)\n", slot.n_thinking_tokens, reasoning_budget);
+                            }
+                            
+                            if (string_ends_with(candidate, close_tag)) {
+                                // the model closed the thinking block naturally
+                                fprintf(stderr, "[REASONING-CLOSE-NATURAL] slot=%d tokens=%d\n",
+                                    slot.id, slot.n_thinking_tokens);
+                                fflush(stderr);
+                                SLT_INF(slot, "REASONING: Natural close detected at token %d\n", slot.n_thinking_tokens);
+                                slot.in_thinking_block = false;
+                            } else if (slot.n_thinking_tokens >= reasoning_budget && slot.forced_tokens.empty()) {
+                                // budget exceeded: queue close tag tokens to forcibly terminate thinking
+                                fprintf(stderr, "[REASONING-INJECT] slot=%d tokens=%d budget=%d INJECTING CLOSE TAG\n",
+                                    slot.id, slot.n_thinking_tokens, reasoning_budget);
+                                fflush(stderr);
+                                SLT_INF(slot, "REASONING: Budget exhausted! Injecting close tag at token %d (budget=%d)\n",
+                                    slot.n_thinking_tokens, reasoning_budget);
+                                slot.forced_tokens = common_tokenize(ctx, close_tag, false, true);
+                                slot.in_thinking_block = false;
+                            }
+                        }
+                    }
                 }
 
                 if (!process_token(result, slot)) {
@@ -2888,6 +3046,8 @@ server_context_meta server_context::get_meta() const {
     return server_context_meta {
         /* build_info             */ build_info,
         /* model_name             */ impl->model_name,
+        /* model_aliases          */ impl->model_aliases,
+        /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
         /* has_mtmd               */ impl->mctx != nullptr,
         /* has_inp_image          */ impl->chat_params.allow_image,
@@ -2904,6 +3064,9 @@ server_context_meta server_context::get_meta() const {
         /* fim_pre_token          */ llama_vocab_fim_pre(impl->vocab),
         /* fim_sub_token          */ llama_vocab_fim_suf(impl->vocab),
         /* fim_mid_token          */ llama_vocab_fim_mid(impl->vocab),
+        /* fim_pad_token          */ llama_vocab_fim_pad(impl->vocab),
+        /* fim_rep_token          */ llama_vocab_fim_rep(impl->vocab),
+        /* fim_sep_token          */ llama_vocab_fim_sep(impl->vocab),
 
         /* model_vocab_type       */ llama_vocab_type(impl->vocab),
         /* model_vocab_n_tokens   */ llama_vocab_n_tokens(impl->vocab),
@@ -3681,6 +3844,8 @@ void server_routes::init_routes() {
             {"data", {
                 {
                     {"id",       meta->model_name},
+                    {"aliases",  meta->model_aliases},
+                    {"tags",     meta->model_tags},
                     {"object",   "model"},
                     {"created",  std::time(0)},
                     {"owned_by", "llamacpp"},

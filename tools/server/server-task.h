@@ -343,6 +343,7 @@ struct server_task_result_cmpl_final : server_task_result {
     int32_t n_decoded;
     int32_t n_prompt_tokens;
     int32_t n_tokens_cached;
+    int32_t n_thinking_tokens = 0;  // tokens generated inside thinking blocks
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
@@ -406,6 +407,7 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     int32_t n_decoded;
     int32_t n_prompt_tokens;
+    int32_t n_thinking_tokens = 0;  // cumulative thinking tokens up to this point
 
     bool post_sampling_probs;
     bool is_progress = false;
@@ -556,6 +558,8 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
+
+    int64_t n_tokens;
 
     std::vector<uint8_t> data;
 
