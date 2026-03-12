@@ -313,6 +313,11 @@ int main(void) {
         printf("  %s\n", tmpl);
     }
 
+    assert(std::find(supported_tmpl.begin(), supported_tmpl.end(), std::string("dots1")) != supported_tmpl.end());
+    formatted_chat.resize(1024);
+    res = llama_chat_apply_template("dots1", conversation.data(), conversation.size(), true, formatted_chat.data(), formatted_chat.size());
+    assert(res >= 0);
+
     // test invalid chat template
     res = llama_chat_apply_template("INVALID TEMPLATE", conversation.data(), conversation.size(), true, formatted_chat.data(), formatted_chat.size());
     assert(res < 0);

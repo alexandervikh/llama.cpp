@@ -75,6 +75,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "grok-2",            LLM_CHAT_TEMPLATE_GROK_2            },
     { "pangu-embedded",    LLM_CHAT_TEMPLATE_PANGU_EMBED       },
     { "solar-open",        LLM_CHAT_TEMPLATE_SOLAR_OPEN        },
+    { "dots1",             LLM_CHAT_TEMPLATE_DOTS1             },
 };
 
 llm_chat_template llm_chat_template_from_str(const std::string & name) {
