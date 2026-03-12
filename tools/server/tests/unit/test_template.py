@@ -103,3 +103,28 @@ def test_add_generation_prompt(template_name: str, expected_generation_prompt: s
         assert expected_generation_prompt in prompt, f"Expected generation prompt ({expected_generation_prompt}) in content ({prompt})"
     else:
         assert expected_generation_prompt not in prompt, f"Did not expect generation prompt ({expected_generation_prompt}) in content ({prompt})"
+
+
+@pytest.mark.parametrize("enable_thinking,expected_end", [
+    (False, "Assistant: <think>\n</think>"),
+    (True,  "Assistant: <think>"),
+])
+def test_enable_thinking_chat_template_kwarg_override(enable_thinking: bool, expected_end: str):
+    global server
+    server.jinja = True
+    server.chat_template_file = '../../../models/templates/llama-cpp-rwkv-world.jinja'
+    server.start()
+
+    res = server.make_request("POST", "/apply-template", data={
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "What is today?"},
+        ],
+        "chat_template_kwargs": {
+            "enable_thinking": enable_thinking,
+        },
+    })
+    assert res.status_code == 200
+    prompt = res.body["prompt"]
+
+    assert prompt.endswith(expected_end), f"Expected prompt to end with '{expected_end}', got '{prompt}'"

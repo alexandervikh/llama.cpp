@@ -2551,6 +2551,8 @@ static common_chat_params common_chat_params_init_granite(const common_chat_temp
 
 static common_chat_params common_chat_params_init_solar_open(const common_chat_template & tmpl, const struct templates_params & inputs) {
     common_chat_params data;
+    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
+    auto include_grammar = true;
 
     // TODO: Reasoning effort
     json additional_context = {};
@@ -2691,7 +2693,7 @@ static common_chat_params common_chat_params_init_exaone_moe(const common_chat_t
     common_chat_params data;
 
     data.prompt = apply(tmpl, inputs);
-    data.format = COMMON_CHAT_FORMAT_EXAONE_MOE;
+    data.format = COMMON_CHAT_FORMAT_PEG_CONSTRUCTED;
     if (string_ends_with(data.prompt, "<think>\n")) {
         if (!inputs.enable_thinking) {
             data.prompt += "</think>\n\n";

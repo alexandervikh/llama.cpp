@@ -1235,9 +1235,9 @@ private:
         // DEBUG: Always log thinking parameters
         fprintf(stderr, "[REASONING-DEBUG] slot=%d thinking_forced_open=%d close_tag='%s' open_tag='%s' budget=%d\n",
             slot.id, 
-            slot.task->params.chat_parser_params.thinking_forced_open ? 1 : 0,
-            slot.task->params.chat_parser_params.thinking_close_tag.c_str(),
-            slot.task->params.chat_parser_params.thinking_open_tag.c_str(),
+            slot.task->params.oaicompat_chat_syntax.thinking_forced_open ? 1 : 0,
+            slot.task->params.oaicompat_chat_syntax.thinking_close_tag.c_str(),
+            slot.task->params.oaicompat_chat_syntax.thinking_open_tag.c_str(),
             params_base.reasoning_budget);
         fflush(stderr);
 
@@ -1247,10 +1247,10 @@ private:
             slot.in_thinking_block = true;
             slot.n_thinking_tokens = 0;
             fprintf(stderr, "[REASONING-INIT] slot=%d thinking_forced_open=TRUE budget=%d close_tag='%s'\n",
-                slot.id, params_base.reasoning_budget, slot.task->params.chat_parser_params.thinking_close_tag.c_str());
+                slot.id, params_base.reasoning_budget, slot.task->params.oaicompat_chat_syntax.thinking_close_tag.c_str());
             fflush(stderr);
             SLT_INF(slot, "REASONING: thinking_forced_open=true, in_thinking_block=true, budget=%d, close_tag='%s'\n",
-                params_base.reasoning_budget, slot.task->params.chat_parser_params.thinking_close_tag.c_str());
+                params_base.reasoning_budget, slot.task->params.oaicompat_chat_syntax.thinking_close_tag.c_str());
         }
 
         slot.state = slot.is_child()
@@ -1500,10 +1500,10 @@ private:
         // For GPT-OSS and similar models that use reasoning_content field in streaming mode
         // Skip post-processing if thinking_forced_open (inline tracking should have counted)
         if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty() &&
-            !slot.task->params.chat_parser_params.thinking_forced_open) {
+            !slot.task->params.oaicompat_chat_syntax.thinking_forced_open) {
             try {
                 SRV_DBG("Attempting to parse reasoning_content in streaming mode (length=%zu)\n", slot.generated_text.size());
-                task_result_state temp_state(slot.task->params.chat_parser_params);
+                task_result_state temp_state(slot.task->params.oaicompat_chat_syntax);
                 std::vector<common_chat_msg_diff> temp_diffs;
                 common_chat_msg parsed_msg = temp_state.update_chat_msg(slot.generated_text, true, temp_diffs);
                 
@@ -1570,10 +1570,10 @@ private:
         // parse the message and count reasoning tokens if inline tracking didn't capture them
         // Skip post-processing if thinking_forced_open (inline tracking should have counted)
         if (res->n_thinking_tokens == 0 && !res->content.empty() &&
-            !slot.task->params.chat_parser_params.thinking_forced_open) {
+            !slot.task->params.oaicompat_chat_syntax.thinking_forced_open) {
             try {
                 SRV_DBG("Attempting to parse reasoning_content from response content (length=%zu)\n", res->content.size());
-                task_result_state temp_state(slot.task->params.chat_parser_params);
+                task_result_state temp_state(slot.task->params.oaicompat_chat_syntax);
                 std::vector<common_chat_msg_diff> temp_diffs;
                 common_chat_msg parsed_msg = temp_state.update_chat_msg(res->content, false, temp_diffs);
                 
@@ -2865,8 +2865,8 @@ private:
                 // --- thinking budget enforcement ---
                 {
                     const int32_t reasoning_budget = params_base.reasoning_budget;
-                    const std::string & open_tag    = slot.task->params.chat_parser_params.thinking_open_tag;
-                    const std::string & close_tag   = slot.task->params.chat_parser_params.thinking_close_tag;
+                    const std::string & open_tag    = slot.task->params.oaicompat_chat_syntax.thinking_open_tag;
+                    const std::string & close_tag   = slot.task->params.oaicompat_chat_syntax.thinking_close_tag;
                     
                     // Log first token to verify budget is active
                     if (slot.in_thinking_block && slot.n_thinking_tokens == 0) {

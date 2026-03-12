@@ -172,6 +172,24 @@ def test_apply_chat_template():
     assert res.body["prompt"] == "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a test.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Hi there<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
 
 
+def test_enable_thinking_chat_template_kwarg_requires_boolean():
+    global server
+    server.start()
+    res = server.make_request("POST", "/chat/completions", data={
+        "max_tokens": 8,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+        ],
+        "chat_template_kwargs": {
+            "enable_thinking": "true",
+        },
+    })
+
+    assert res.status_code == 400
+    assert "error" in res.body
+    assert 'invalid type for "enable_thinking"' in res.body["error"]["message"]
+
+
 @pytest.mark.parametrize("response_format,n_predicted,re_content", [
     ({"type": "json_object", "schema": {"const": "42"}}, 6, "\"42\""),
     ({"type": "json_object", "schema": {"items": [{"type": "integer"}]}}, 10, "[ -3000 ]"),
