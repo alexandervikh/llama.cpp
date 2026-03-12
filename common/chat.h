@@ -176,13 +176,48 @@ struct common_chat_syntax {
     std::string              thinking_close_tag;            // close tag string, e.g. "</think>"
     bool                     parse_tool_calls      = true;
     common_peg_arena         parser                = {};
-    
-    common_chat_syntax() = default;
-    common_chat_syntax(const common_chat_params & chat_params) {
-        format               = chat_params.format;
-        thinking_forced_open = chat_params.thinking_forced_open;
-        thinking_open_tag    = chat_params.thinking_open_tag;
-        thinking_close_tag   = chat_params.thinking_close_tag;
+
+    common_chat_syntax(
+            common_chat_format format = COMMON_CHAT_FORMAT_CONTENT_ONLY,
+            common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE,
+            bool reasoning_in_content = false,
+            bool thinking_forced_open = false,
+            std::string thinking_open_tag = {},
+            std::string thinking_close_tag = {},
+            bool parse_tool_calls = true,
+            common_peg_arena parser = {})
+        : format(format),
+          reasoning_format(reasoning_format),
+          reasoning_in_content(reasoning_in_content),
+          thinking_forced_open(thinking_forced_open),
+          thinking_open_tag(std::move(thinking_open_tag)),
+          thinking_close_tag(std::move(thinking_close_tag)),
+          parse_tool_calls(parse_tool_calls),
+          parser(std::move(parser)) {
+    }
+
+    common_chat_syntax(
+            common_chat_format format,
+            common_reasoning_format reasoning_format,
+            bool reasoning_in_content,
+            bool thinking_forced_open,
+            bool parse_tool_calls)
+        : common_chat_syntax(
+            format,
+            reasoning_format,
+            reasoning_in_content,
+            thinking_forced_open,
+            {},
+            {},
+            parse_tool_calls,
+            {}) {
+    }
+
+    common_chat_syntax(const common_chat_params & chat_params)
+        : format(chat_params.format),
+          thinking_forced_open(chat_params.thinking_forced_open),
+          thinking_open_tag(chat_params.thinking_open_tag),
+          thinking_close_tag(chat_params.thinking_close_tag) {
     }
 };
 

@@ -616,15 +616,16 @@ void test_command7_parser_compare(testing & t) {
 
     auto test_legacy = [&](const std::string & input, bool need_more_input, bool print_results) {
         // Original common_chat_combinator_parser taken from chat.cpp
+        common_chat_syntax syntax = {
+            /* .format = */ COMMON_CHAT_FORMAT_GENERIC,
+            /* .reasoning_format = */ COMMON_REASONING_FORMAT_AUTO,
+            /* .reasoning_in_content = */ false,
+            /* .thinking_forced_open = */ false,
+        };
         common_chat_msg_parser builder(
             input,
             /* .is_partial = */ need_more_input,
-            {
-                /* .format = */ COMMON_CHAT_FORMAT_GENERIC,
-                /* .reasoning_format = */ COMMON_REASONING_FORMAT_AUTO,
-                /* .reasoning_in_content = */ false,
-                /* .thinking_forced_open = */ false,
-            }
+            syntax
         );
 
         builder.try_parse_reasoning("<|START_THINKING|>", "<|END_THINKING|>");

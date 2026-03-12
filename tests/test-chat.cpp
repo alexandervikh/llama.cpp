@@ -472,7 +472,7 @@ static void test_parser_with_streaming(const common_chat_msg & expected, const s
             }
             if (diff.tool_call_index != std::string::npos) {
                 if (!diff.tool_call_delta.name.empty()) {
-                    merged.tool_calls.push_back({diff.tool_call_delta.name, "", ""});
+                    merged.tool_calls.push_back(common_chat_tool_call{diff.tool_call_delta.name, "", ""});
                 }
                 if (!diff.tool_call_delta.arguments.empty()) {
                     GGML_ASSERT(!merged.tool_calls.empty());
@@ -589,7 +589,7 @@ static void test_peg_parser(common_chat_templates * tmpls, const std::function<v
             }
             if (diff.tool_call_index != std::string::npos) {
                 if (!diff.tool_call_delta.name.empty()) {
-                    msg_accum.tool_calls.push_back({diff.tool_call_delta.name, "", ""});
+                    msg_accum.tool_calls.push_back(common_chat_tool_call{diff.tool_call_delta.name, "", ""});
                 }
                 if (!diff.tool_call_delta.arguments.empty()) {
                     msg_accum.tool_calls.back().arguments += diff.tool_call_delta.arguments;
