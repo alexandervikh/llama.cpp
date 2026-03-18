@@ -65,6 +65,39 @@ static bool server_task_type_need_logits(server_task_type task_type) {
     }
 }
 
+std::optional<std::string> server_reasoning_budget_handle_thinking_transition(
+        bool & in_thinking_block,
+        int32_t & n_thinking_tokens,
+        int32_t reasoning_budget,
+        const std::string & open_tag,
+        const std::string & close_tag,
+        const std::string & candidate) {
+    if (close_tag.empty()) {
+        return std::nullopt;
+    }
+
+    if (!in_thinking_block) {
+        if (!open_tag.empty() && string_ends_with(candidate, open_tag)) {
+            n_thinking_tokens = 0;
+            if (reasoning_budget == 0) {
+                return close_tag;
+            }
+            if (reasoning_budget > 0) {
+                in_thinking_block = true;
+            }
+        }
+        return std::nullopt;
+    }
+
+    if (reasoning_budget == 0) {
+        in_thinking_block = false;
+        n_thinking_tokens = 0;
+        return close_tag;
+    }
+
+    return std::nullopt;
+}
+
 struct server_slot {
     int id;
 
@@ -1244,13 +1277,19 @@ private:
         // if thinking block is already open in the prompt, start counting immediately
         if (slot.task->params.oaicompat_chat_syntax.thinking_forced_open &&
                 !slot.task->params.oaicompat_chat_syntax.thinking_close_tag.empty()) {
-            slot.in_thinking_block = true;
-            slot.n_thinking_tokens = 0;
-            fprintf(stderr, "[REASONING-INIT] slot=%d thinking_forced_open=TRUE budget=%d close_tag='%s'\n",
-                slot.id, params_base.reasoning_budget, slot.task->params.oaicompat_chat_syntax.thinking_close_tag.c_str());
-            fflush(stderr);
-            SLT_INF(slot, "REASONING: thinking_forced_open=true, in_thinking_block=true, budget=%d, close_tag='%s'\n",
-                params_base.reasoning_budget, slot.task->params.oaicompat_chat_syntax.thinking_close_tag.c_str());
+            if (params_base.reasoning_budget == 0) {
+                slot.forced_tokens = common_tokenize(ctx, slot.task->params.oaicompat_chat_syntax.thinking_close_tag, false, true);
+                slot.in_thinking_block = false;
+                slot.n_thinking_tokens = 0;
+            } else {
+                slot.in_thinking_block = true;
+                slot.n_thinking_tokens = 0;
+                fprintf(stderr, "[REASONING-INIT] slot=%d thinking_forced_open=TRUE budget=%d close_tag='%s'\n",
+                    slot.id, params_base.reasoning_budget, slot.task->params.oaicompat_chat_syntax.thinking_close_tag.c_str());
+                fflush(stderr);
+                SLT_INF(slot, "REASONING: thinking_forced_open=true, in_thinking_block=true, budget=%d, close_tag='%s'\n",
+                    params_base.reasoning_budget, slot.task->params.oaicompat_chat_syntax.thinking_close_tag.c_str());
+            }
         }
 
         slot.state = slot.is_child()
@@ -2877,15 +2916,22 @@ private:
                             reasoning_budget, close_tag.c_str());
                     }
                     
-                    if (reasoning_budget > 0 && !close_tag.empty()) {
+                    if (!close_tag.empty()) {
                         const std::string candidate = slot.generated_text + result.text_to_send;
-                        if (!slot.in_thinking_block) {
-                            // detect entry into thinking block for models that generate the open tag themselves
-                            if (!open_tag.empty() && string_ends_with(candidate, open_tag)) {
-                                slot.in_thinking_block = true;
-                                slot.n_thinking_tokens = 0;
-                            }
-                        } else {
+                        const bool was_in_thinking_block = slot.in_thinking_block;
+                        auto forced_close = server_reasoning_budget_handle_thinking_transition(
+                            slot.in_thinking_block,
+                            slot.n_thinking_tokens,
+                            reasoning_budget,
+                            open_tag,
+                            close_tag,
+                            candidate);
+
+                        if (forced_close.has_value() && slot.forced_tokens.empty()) {
+                            slot.forced_tokens = common_tokenize(ctx, *forced_close, false, true);
+                        }
+
+                        if (reasoning_budget > 0 && was_in_thinking_block && slot.in_thinking_block) {
                             slot.n_thinking_tokens++;
                             
                             // Log every 5 tokens to trace counting

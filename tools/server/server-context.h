@@ -6,8 +6,18 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
+#include <string>
 
 struct server_context_impl; // private implementation
+
+std::optional<std::string> server_reasoning_budget_handle_thinking_transition(
+        bool & in_thinking_block,
+        int32_t & n_thinking_tokens,
+        int32_t reasoning_budget,
+        const std::string & open_tag,
+        const std::string & close_tag,
+        const std::string & candidate);
 
 struct server_context_meta {
     std::string build_info;
