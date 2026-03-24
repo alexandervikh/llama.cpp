@@ -98,6 +98,12 @@ std::optional<std::string> server_reasoning_budget_handle_thinking_transition(
     return std::nullopt;
 }
 
+int32_t server_resolve_reasoning_token_count(
+        int32_t inline_count,
+        int32_t reparsed_count) {
+    return std::max(inline_count, reparsed_count);
+}
+
 struct server_slot {
     int id;
 
@@ -1536,9 +1542,9 @@ private:
         res->n_prompt_tokens     = slot.task->n_tokens();
         res->n_thinking_tokens   = slot.n_thinking_tokens;
 
-        // For GPT-OSS and similar models that use reasoning_content field in streaming mode
-        // Skip post-processing if thinking_forced_open (inline tracking should have counted)
-        if (!is_progress && res->n_thinking_tokens == 0 && !slot.generated_text.empty() &&
+        // For GPT-OSS and similar models that use reasoning_content field in streaming mode,
+        // reconcile reparsed reasoning tokens with the inline counter.
+        if (!is_progress && !slot.generated_text.empty() &&
             !slot.task->params.oaicompat_chat_syntax.thinking_forced_open) {
             try {
                 SRV_DBG("Attempting to parse reasoning_content in streaming mode (length=%zu)\n", slot.generated_text.size());
@@ -1550,7 +1556,9 @@ private:
                 
                 if (!parsed_msg.reasoning_content.empty()) {
                     llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
-                    res->n_thinking_tokens = reasoning_tokens.size();
+                    res->n_thinking_tokens = server_resolve_reasoning_token_count(
+                        res->n_thinking_tokens,
+                        reasoning_tokens.size());
                     SRV_DBG("Set n_thinking_tokens to %d from reasoning_content in streaming mode\n", res->n_thinking_tokens);
                 }
             } catch (const std::exception & e) {
@@ -1606,9 +1614,8 @@ private:
         res->n_thinking_tokens   = slot.n_thinking_tokens;
 
         // For GPT-OSS and similar models that use reasoning_content field,
-        // parse the message and count reasoning tokens if inline tracking didn't capture them
-        // Skip post-processing if thinking_forced_open (inline tracking should have counted)
-        if (res->n_thinking_tokens == 0 && !res->content.empty() &&
+        // reconcile reparsed reasoning tokens with the inline counter.
+        if (!res->content.empty() &&
             !slot.task->params.oaicompat_chat_syntax.thinking_forced_open) {
             try {
                 SRV_DBG("Attempting to parse reasoning_content from response content (length=%zu)\n", res->content.size());
@@ -1622,7 +1629,9 @@ private:
                 if (!parsed_msg.reasoning_content.empty()) {
                     // Tokenize the reasoning_content to get accurate token count
                     llama_tokens reasoning_tokens = common_tokenize(ctx, parsed_msg.reasoning_content, false);
-                    res->n_thinking_tokens = reasoning_tokens.size();
+                    res->n_thinking_tokens = server_resolve_reasoning_token_count(
+                        res->n_thinking_tokens,
+                        reasoning_tokens.size());
                     SRV_DBG("Set n_thinking_tokens to %d from reasoning_content\n", res->n_thinking_tokens);
                 }
             } catch (const std::exception & e) {

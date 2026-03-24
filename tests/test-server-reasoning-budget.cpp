@@ -1,8 +1,14 @@
 #include "tools/server/server-context.h"
 
-#include <cassert>
+#include <cstdlib>
 #include <optional>
 #include <string>
+
+static void check(bool condition) {
+    if (!condition) {
+        std::abort();
+    }
+}
 
 static void test_budget_zero_closes_detected_open_tag() {
     bool in_thinking_block = false;
@@ -16,10 +22,10 @@ static void test_budget_zero_closes_detected_open_tag() {
         /* close_tag = */ "<|end|>",
         /* candidate = */ "<|channel|>analysis<|message|>");
 
-    assert(forced_close.has_value());
-    assert(*forced_close == "<|end|>");
-    assert(!in_thinking_block);
-    assert(n_thinking_tokens == 0);
+    check(forced_close.has_value());
+    check(*forced_close == "<|end|>");
+    check(!in_thinking_block);
+    check(n_thinking_tokens == 0);
 }
 
 static void test_positive_budget_enters_thinking_block() {
@@ -34,9 +40,9 @@ static void test_positive_budget_enters_thinking_block() {
         /* close_tag = */ "<|end|>",
         /* candidate = */ "<|channel|>analysis<|message|>");
 
-    assert(!forced_close.has_value());
-    assert(in_thinking_block);
-    assert(n_thinking_tokens == 0);
+    check(!forced_close.has_value());
+    check(in_thinking_block);
+    check(n_thinking_tokens == 0);
 }
 
 static void test_budget_zero_closes_existing_thinking_block() {
@@ -51,15 +57,29 @@ static void test_budget_zero_closes_existing_thinking_block() {
         /* close_tag = */ "<|end|>",
         /* candidate = */ "<|channel|>analysis<|message|>internal step");
 
-    assert(forced_close.has_value());
-    assert(*forced_close == "<|end|>");
-    assert(!in_thinking_block);
-    assert(n_thinking_tokens == 0);
+    check(forced_close.has_value());
+    check(*forced_close == "<|end|>");
+    check(!in_thinking_block);
+    check(n_thinking_tokens == 0);
+}
+
+static void test_reparsed_reasoning_count_wins_when_inline_is_partial() {
+    check(server_resolve_reasoning_token_count(
+        /* inline_count = */ 8,
+        /* reparsed_count = */ 125) == 125);
+}
+
+static void test_inline_reasoning_count_kept_when_reparsed_is_smaller() {
+    check(server_resolve_reasoning_token_count(
+        /* inline_count = */ 20,
+        /* reparsed_count = */ 13) == 20);
 }
 
 int main() {
     test_budget_zero_closes_detected_open_tag();
     test_positive_budget_enters_thinking_block();
     test_budget_zero_closes_existing_thinking_block();
+    test_reparsed_reasoning_count_wins_when_inline_is_partial();
+    test_inline_reasoning_count_kept_when_reparsed_is_smaller();
     return 0;
 }

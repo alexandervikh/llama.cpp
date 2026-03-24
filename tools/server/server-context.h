@@ -19,6 +19,10 @@ std::optional<std::string> server_reasoning_budget_handle_thinking_transition(
         const std::string & close_tag,
         const std::string & candidate);
 
+int32_t server_resolve_reasoning_token_count(
+        int32_t inline_count,
+        int32_t reparsed_count);
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;
