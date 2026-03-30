@@ -3,7 +3,7 @@
 
 set -e
 
-REMOTE="main.bench.alexandervikhorev.coder"
+REMOTE_HOST="${REMOTE_HOST:?Set REMOTE_HOST to your bench hostname}"
 MODEL="models/gpt-oss-20b-q4_k_m.gguf"
 PORT=8080
 
@@ -30,10 +30,10 @@ for BUDGET in "${BUDGETS[@]}"; do
     echo "--- Testing budget=$BUDGET ---"
     
     # Kill and restart server with new budget
-    ssh $REMOTE 'pkill llama-server || true'
+    ssh "$REMOTE_HOST" 'pkill llama-server || true'
     sleep 2
     
-    ssh $REMOTE "cd llama.cpp && build-test/bin/llama-server \
+    ssh "$REMOTE_HOST" "cd llama.cpp && build-test/bin/llama-server \
         --model $MODEL \
         --reasoning-budget $BUDGET \
         --port $PORT \
@@ -48,7 +48,7 @@ for BUDGET in "${BUDGETS[@]}"; do
     # Run test and measure time
     START=$(date +%s.%N)
     
-    ssh $REMOTE "curl -s http://localhost:$PORT/v1/chat/completions \
+    ssh "$REMOTE_HOST" "curl -s http://localhost:$PORT/v1/chat/completions \
         -H 'Content-Type: application/json' \
         -d '{
             \"messages\": [{\"role\": \"user\", \"content\": \"$QUESTION\"}],
@@ -77,7 +77,7 @@ for BUDGET in "${BUDGETS[@]}"; do
 done
 
 # Kill server
-ssh $REMOTE 'pkill llama-server || true'
+ssh "$REMOTE_HOST" 'pkill llama-server || true'
 
 echo ""
 echo "==================================================================="

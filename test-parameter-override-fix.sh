@@ -3,7 +3,7 @@
 
 set -e
 
-REMOTE="main.bench.alexandervikhorev.coder"
+REMOTE_HOST="${REMOTE_HOST:?Set REMOTE_HOST to your bench hostname}"
 MODEL="models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf"
 PORT=8080
 
@@ -13,12 +13,12 @@ echo "==================================================================="
 
 echo ""
 echo "Step 1: Kill any existing servers..."
-ssh $REMOTE 'pkill llama-server || true'
+ssh "$REMOTE_HOST" 'pkill llama-server || true'
 sleep 2
 
 echo ""
 echo "Step 2: Start server with reasoning-budget=20..."
-ssh $REMOTE "cd llama.cpp && build-test/bin/llama-server \
+ssh "$REMOTE_HOST" "cd llama.cpp && build-test/bin/llama-server \
   --model $MODEL \
   --reasoning-budget 20 \
   --port $PORT \
@@ -31,7 +31,7 @@ sleep 35
 
 echo ""
 echo "Step 3: Test WITHOUT explicit parameters (should use post-processing)..."
-curl -s http://$REMOTE:$PORT/v1/chat/completions \
+curl -s "http://$REMOTE_HOST:$PORT/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": "What is 15*12?"}],
@@ -44,7 +44,7 @@ DEFAULT_REASONING=$(jq -r '.usage.reasoning_tokens' /tmp/test-default.json)
 
 echo ""
 echo "Step 4: Test WITH explicit parameters (should enforce budget with inline tracking)..."
-curl -s http://$REMOTE:$PORT/v1/chat/completions \
+curl -s "http://$REMOTE_HOST:$PORT/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": "What is 15*12?"}],
@@ -61,19 +61,19 @@ EXPLICIT_REASONING=$(jq -r '.usage.reasoning_tokens' /tmp/test-explicit.json)
 echo ""
 echo "Step 5: Check debug logs..."
 echo "--- REASONING-DEBUG (should show thinking_forced_open=1) ---"
-ssh $REMOTE 'tail -200 /tmp/server-final-test.log | grep "REASONING-DEBUG" | tail -2'
+ssh "$REMOTE_HOST" 'tail -200 /tmp/server-final-test.log | grep "REASONING-DEBUG" | tail -2'
 
 echo ""
 echo "--- REASONING-INIT (should appear for explicit test) ---"
-ssh $REMOTE 'tail -200 /tmp/server-final-test.log | grep "REASONING-INIT" | tail -1'
+ssh "$REMOTE_HOST" 'tail -200 /tmp/server-final-test.log | grep "REASONING-INIT" | tail -1'
 
 echo ""
 echo "--- REASONING-COUNT (should show token counting) ---"
-ssh $REMOTE 'tail -200 /tmp/server-final-test.log | grep "REASONING-COUNT" | tail -5'
+ssh "$REMOTE_HOST" 'tail -200 /tmp/server-final-test.log | grep "REASONING-COUNT" | tail -5'
 
 echo ""
 echo "--- REASONING-INJECT (should show budget enforcement at 20 tokens) ---"
-ssh $REMOTE 'tail -200 /tmp/server-final-test.log | grep "REASONING-INJECT" | tail -1'
+ssh "$REMOTE_HOST" 'tail -200 /tmp/server-final-test.log | grep "REASONING-INJECT" | tail -1'
 
 echo ""
 echo "==================================================================="

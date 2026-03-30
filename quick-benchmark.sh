@@ -1,6 +1,8 @@
 #!/bin/bash
 # Quick benchmark for reasoning budgets on GPT-OSS
 
+REMOTE_HOST="${REMOTE_HOST:?Set REMOTE_HOST to your bench hostname}"
+
 echo "Starting GPT-OSS reasoning budget benchmark..."
 echo ""
 
@@ -9,7 +11,7 @@ test_budget() {
     local BUDGET=$1
     echo "Testing budget=$BUDGET..."
     
-    ssh main.bench.alexandervikhorev.coder "pkill llama-server; sleep 2; \
+    ssh "$REMOTE_HOST" "pkill llama-server; sleep 2; \
         cd llama.cpp && build-test/bin/llama-server \
         --model models/gpt-oss-20b-q4_k_m.gguf \
         --reasoning-budget $BUDGET \
@@ -19,7 +21,7 @@ test_budget() {
     
     # Test with timing
     local START=$(date +%s)
-    ssh main.bench.alexandervikhorev.coder "curl -s http://localhost:8080/v1/chat/completions \
+    ssh "$REMOTE_HOST" "curl -s http://localhost:8080/v1/chat/completions \
         -H 'Content-Type: application/json' \
         -d '{\"messages\":[{\"role\":\"user\",\"content\":\"What is (15*8)+(23*4)-(7*6)? Think step by step.\"}],\"max_tokens\":120}'" \
         > /tmp/test-b${BUDGET}.json 2>&1
@@ -41,7 +43,7 @@ test_budget 0
 test_budget 10
 test_budget 50
 
-ssh main.bench.alexandervikhorev.coder 'pkill llama-server' 2>/dev/null
+ssh "$REMOTE_HOST" 'pkill llama-server' 2>/dev/null
 
 echo ""
 echo "Benchmark complete!"
