@@ -275,6 +275,11 @@ unset(LLAMA_TEST_NAME)
 llama_build(test-spec-prefill-bench.cpp)
 target_include_directories(test-spec-prefill-bench PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+# Speculative prefill quality gate
+unset(LLAMA_TEST_NAME)
+llama_build(test-spec-prefill-quality.cpp)
+target_include_directories(test-spec-prefill-quality PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 # Importance scoring debug test
 unset(LLAMA_TEST_NAME)
 llama_build(test-importance-debug.cpp)
