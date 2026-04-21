@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include <string>
 #include <vector>
 
 // Lookahead generation statistics for importance scoring
@@ -37,6 +38,7 @@ struct llama_spec_prefill_context {
     std::vector<llama_lookahead_stat> lookahead_stats;  // Statistics from lookahead generation
     llama_spec_prefill_params params;  // Configuration parameters
     int actual_lookahead_cnt;  // Actual number of lookahead tokens (may be less if EOS hit)
+    std::string dump_path;     // Optional path to dump parity traces (empty = disabled)
 };
 
 // Initialize speculative prefill context
@@ -125,6 +127,12 @@ int llama_spec_prefill_process_base(
     const llama_token * filtered_tokens,
     const int * filtered_positions,
     int n_filtered
+);
+
+// Set path to dump parity traces (JSONL format, one record per call)
+void llama_spec_prefill_set_dump_path(
+    llama_spec_prefill_context * ctx,
+    const char * path
 );
 
 // End-to-end speculative prefill pipeline

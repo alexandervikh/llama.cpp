@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <fstream>
 
 llama_spec_prefill_context * llama_spec_prefill_init(
     llama_context * ctx_base,
@@ -43,6 +44,15 @@ llama_spec_prefill_context * llama_spec_prefill_init_with_params(
     return ctx;
 }
 
+void llama_spec_prefill_set_dump_path(
+    llama_spec_prefill_context * ctx,
+    const char * path
+) {
+    if (ctx && path) {
+        ctx->dump_path = path;
+    }
+}
+
 void llama_spec_prefill_free(llama_spec_prefill_context * ctx) {
     if (ctx) {
         delete ctx;
@@ -61,8 +71,7 @@ int llama_spec_prefill_generate_lookahead(
     }
 
     // Clear spec model KV cache
-    llama_memory_t mem = llama_get_memory(ctx->ctx_spec);
-    llama_memory_seq_rm(mem, 0, 0, -1);
+    llama_memory_clear(llama_get_memory(ctx->ctx_spec), false);
 
     const llama_model * model = llama_get_model(ctx->ctx_spec);
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -83,6 +92,7 @@ int llama_spec_prefill_generate_lookahead(
     batch.logits[batch.n_tokens - 1] = true;
 
     if (llama_decode(ctx->ctx_spec, batch) != 0) {
+        fprintf(stderr, "[spec-prefill] generate_lookahead initial decode failed n_prompt=%d\n", n_prompt);
         llama_batch_free(batch);
         return -1;
     }
@@ -248,93 +258,121 @@ int llama_spec_prefill_compute_importance(
         return -1;
     }
 
-    // Phase 5: Attention-Based Importance Scoring
-    // Uses lookahead prediction quality as proxy for token importance
-    // Intuition: Tokens that lead to confident predictions are important
-    
     token_importance.resize(n_prompt, 0.0f);
-    
-    if (ctx->lookahead_stats.empty()) {
-        // Fallback to position-based if no lookahead stats
-        for (int i = 0; i < n_prompt; i++) {
-            token_importance[i] = 0.1f + 0.9f * (float)i / (n_prompt - 1);
+
+    // Perplexity-based scoring: importance[i+1] = -log P(token[i+1] | context[0..i])
+    // Processed in chunks of CHUNK_SIZE to match the n_ubatch=512 graph reservation.
+    // Logits are read immediately after each chunk before the next chunk overwrites the buffer.
+    const int PERPLEXITY_THRESHOLD = 4096;
+    const int CHUNK_SIZE = 512;
+
+    if (n_prompt <= PERPLEXITY_THRESHOLD && ctx->ctx_spec) {
+        llama_memory_clear(llama_get_memory(ctx->ctx_spec), false);
+
+        const llama_model * model = llama_get_model(ctx->ctx_spec);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        int n_vocab = llama_vocab_n_tokens(vocab);
+
+        token_importance[0] = 1.0f;  // BOS / first token always kept
+
+        bool perplexity_ok = true;
+        int chunk_start = 0;
+        while (chunk_start < n_prompt && perplexity_ok) {
+            int chunk_end = std::min(chunk_start + CHUNK_SIZE, n_prompt);
+            int chunk_len = chunk_end - chunk_start;
+
+            llama_batch batch = llama_batch_init(chunk_len, 0, 1);
+            batch.n_tokens = 0;
+            for (int i = chunk_start; i < chunk_end; i++) {
+                batch.token[batch.n_tokens]     = prompt_tokens[i];
+                batch.pos[batch.n_tokens]       = i;
+                batch.n_seq_id[batch.n_tokens]  = 1;
+                batch.seq_id[batch.n_tokens][0] = 0;
+                batch.logits[batch.n_tokens]    = true;
+                batch.n_tokens++;
+            }
+
+            if (llama_decode(ctx->ctx_spec, batch) != 0) {
+                llama_batch_free(batch);
+                perplexity_ok = false;
+                break;
+            }
+
+            // Read logits for each token in the chunk immediately (before next chunk overwrites)
+            for (int k = 0; k < chunk_len; k++) {
+                int global_pos = chunk_start + k;
+                if (global_pos + 1 >= n_prompt) break;  // no next token to predict
+                float * logits = llama_get_logits_ith(ctx->ctx_spec, k);
+                float max_logit = logits[0];
+                for (int j = 1; j < n_vocab; j++)
+                    if (logits[j] > max_logit) max_logit = logits[j];
+                float sum_exp = 0.0f;
+                for (int j = 0; j < n_vocab; j++)
+                    sum_exp += expf(logits[j] - max_logit);
+                llama_token next_tok = prompt_tokens[global_pos + 1];
+                float log_prob = (logits[next_tok] - max_logit) - logf(sum_exp);
+                token_importance[global_pos + 1] = -log_prob;  // surprise >= 0
+            }
+
+            llama_batch_free(batch);
+            chunk_start = chunk_end;
         }
+
+        if (perplexity_ok) {
+            // Normalize to [0, 1]
+            float min_imp = token_importance[0], max_imp = token_importance[0];
+            for (float v : token_importance) {
+                if (v < min_imp) min_imp = v;
+                if (v > max_imp) max_imp = v;
+            }
+            float range = max_imp - min_imp;
+            if (range > 1e-6f)
+                for (float & v : token_importance) v = (v - min_imp) / range;
+
+            if (ctx->params.pool_kernel_size > 1)
+                llama_spec_prefill_apply_pooling(token_importance, ctx->params.pool_kernel_size);
+
+            return 0;
+        }
+        // Decode failed — clear corrupted KV state then fall through to entropy proxy
+        llama_memory_clear(llama_get_memory(ctx->ctx_spec), false);
+    }
+
+    // --- Entropy proxy fallback (long prompts or decode failure) ---
+    if (ctx->lookahead_stats.empty()) {
+        for (int i = 0; i < n_prompt; i++)
+            token_importance[i] = 0.1f + 0.9f * (float)i / (n_prompt - 1);
         return 0;
     }
-    
-    // Compute importance based on lookahead statistics
-    // Strategy: Distribute importance based on prediction confidence
-    
-    // 1. Compute average confidence (inverse entropy)
-    float total_confidence = 0.0f;
-    float max_entropy = 0.0f;
-    
-    for (const auto & stat : ctx->lookahead_stats) {
-        if (stat.entropy > max_entropy) {
-            max_entropy = stat.entropy;
-        }
-    }
-    
-    // Avoid division by zero
-    if (max_entropy < 1e-6f) {
-        max_entropy = 1.0f;
-    }
-    
-    for (const auto & stat : ctx->lookahead_stats) {
-        // Confidence = 1 - normalized_entropy
-        // Low entropy (confident prediction) -> high confidence
-        float confidence = 1.0f - (stat.entropy / max_entropy);
-        total_confidence += confidence;
-    }
-    
-    // 2. Distribute importance using distance-based weighting
-    // Tokens closer to confident predictions get higher importance
+
+    float max_entropy = 1e-6f;
+    for (const auto & stat : ctx->lookahead_stats)
+        if (stat.entropy > max_entropy) max_entropy = stat.entropy;
+
     for (int i = 0; i < n_prompt; i++) {
         float importance = 0.0f;
-        
         for (const auto & stat : ctx->lookahead_stats) {
-            // Distance from token i to lookahead position
             int distance = stat.position - i;
-            
             if (distance > 0) {
-                // Confidence contribution weighted by inverse distance
-                // Closer tokens contribute more
                 float confidence = 1.0f - (stat.entropy / max_entropy);
-                float distance_weight = 1.0f / (1.0f + sqrtf((float)distance));
-                
-                importance += confidence * distance_weight;
+                importance += confidence / (1.0f + sqrtf((float)distance));
             }
         }
-        
-        // Normalize and add base importance
         token_importance[i] = 0.1f + 0.9f * importance;
     }
-    
-    // 3. Normalize importance scores to [0.1, 1.0] range
-    float min_importance = token_importance[0];
-    float max_importance = token_importance[0];
-    
+
+    float min_imp = token_importance[0], max_imp = token_importance[0];
     for (int i = 1; i < n_prompt; i++) {
-        if (token_importance[i] < min_importance) {
-            min_importance = token_importance[i];
-        }
-        if (token_importance[i] > max_importance) {
-            max_importance = token_importance[i];
-        }
+        if (token_importance[i] < min_imp) min_imp = token_importance[i];
+        if (token_importance[i] > max_imp) max_imp = token_importance[i];
     }
-    
-    float importance_range = max_importance - min_importance;
-    if (importance_range > 1e-6f) {
-        for (int i = 0; i < n_prompt; i++) {
-            float normalized = (token_importance[i] - min_importance) / importance_range;
-            token_importance[i] = 0.1f + 0.9f * normalized;
-        }
-    }
-    
-    // 4. Apply smoothing/pooling if configured (like vLLM's avg_pool1d)
-    if (ctx->params.pool_kernel_size > 1) {
+    float range = max_imp - min_imp;
+    if (range > 1e-6f)
+        for (int i = 0; i < n_prompt; i++)
+            token_importance[i] = 0.1f + 0.9f * (token_importance[i] - min_imp) / range;
+
+    if (ctx->params.pool_kernel_size > 1)
         llama_spec_prefill_apply_pooling(token_importance, ctx->params.pool_kernel_size);
-    }
 
     return 0;
 }
@@ -497,17 +535,17 @@ int llama_spec_prefill_process_base(
     }
 
     // Clear base model KV cache
-    llama_memory_t mem = llama_get_memory(ctx->ctx_base);
-    llama_memory_seq_rm(mem, 0, 0, -1);
+    llama_memory_clear(llama_get_memory(ctx->ctx_base), false);
 
     // Process filtered tokens with their original positions
     llama_batch batch = llama_batch_init(n_filtered, 0, 1);
     batch.n_tokens = 0;
 
     for (int i = 0; i < n_filtered; i++) {
-        // Use original position IDs to preserve positional embeddings
+        // Positions are re-indexed 0..n_filtered-1 because llama.cpp's batch allocator
+        // requires contiguous positions. Original positions had gaps from chunk filtering.
         batch.token[batch.n_tokens] = filtered_tokens[i];
-        batch.pos[batch.n_tokens] = filtered_positions[i];
+        batch.pos[batch.n_tokens] = i;
         batch.n_seq_id[batch.n_tokens] = 1;
         batch.seq_id[batch.n_tokens][0] = 0;
         batch.logits[batch.n_tokens] = (i == n_filtered - 1);
@@ -515,6 +553,9 @@ int llama_spec_prefill_process_base(
     }
 
     int result = llama_decode(ctx->ctx_base, batch);
+    if (result != 0) {
+        fprintf(stderr, "[spec-prefill] process_base decode failed n_filtered=%d\n", n_filtered);
+    }
     llama_batch_free(batch);
 
     return result;
@@ -541,23 +582,27 @@ int llama_spec_prefill(
         ctx, prompt_tokens, n_prompt, lookahead_tokens.data(), actual_lookahead
     );
     if (n_generated <= 0) {
+        fprintf(stderr, "[spec-prefill] step1 generate_lookahead failed n_generated=%d n_prompt=%d\n", n_generated, n_prompt);
         return -1;
     }
 
     // Step 2: Extract Q/K tensors (simplified for POC)
     if (llama_spec_prefill_extract_qk(ctx, lookahead_tokens.data(), n_generated) != 0) {
+        fprintf(stderr, "[spec-prefill] step2 extract_qk failed\n");
         return -1;
     }
 
     // Step 3: Compute attention scores (simplified for POC)
     if (llama_spec_prefill_compute_attention(
             ctx, prompt_tokens, n_prompt, lookahead_tokens.data(), n_generated) != 0) {
+        fprintf(stderr, "[spec-prefill] step3 compute_attention failed\n");
         return -1;
     }
 
     // Step 4: Compute token importance (with pooling applied inside)
     std::vector<float> token_importance;
     if (llama_spec_prefill_compute_importance(ctx, prompt_tokens, n_prompt, token_importance) != 0) {
+        fprintf(stderr, "[spec-prefill] step4 compute_importance failed\n");
         return -1;
     }
 
@@ -595,5 +640,19 @@ int llama_spec_prefill(
         return -1;
     }
 
-    return (int)filtered_tokens.size();
+    int n_kept = (int)filtered_tokens.size();
+
+    // Write parity trace if dump path is set
+    if (!ctx->dump_path.empty()) {
+        std::ofstream f(ctx->dump_path, std::ios::app);
+        if (f) {
+            f << "{\"n_prompt\":" << n_prompt
+              << ",\"n_kept\":" << n_kept
+              << ",\"keep_ratio\":" << actual_keep_ratio
+              << ",\"n_lookahead\":" << actual_lookahead
+              << "}\n";
+        }
+    }
+
+    return n_kept;
 }
