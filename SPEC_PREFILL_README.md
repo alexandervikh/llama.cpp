@@ -16,24 +16,18 @@ based on: https://github.com/Jingyu6/speculative_prefill
 ## Building & Running Tests
 
 ```bash
-# Build the test binary
-cmake --build build --target test-spec-prefill -j4
+# Build the full test suite (7 binaries)
+cmake --build build -j4
 
-# Run tests (8/8 pass)
-./build/bin/test-spec-prefill models/qwen2.5-0.5b-instruct-q4_k_m.gguf
-```
+# Run unit tests
+./build/bin/test-spec-prefill-unit --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-### Test Suite:
-```
-[1] test_dual_model_loading
-[2] test_spec_model_lookahead_generation
-[3] test_attention_score_extraction
-[4] test_attention_computation
-[5] test_token_importance_aggregation
-[6] test_token_filtering
-[7] test_base_model_execution_with_filtered_prompt
-[8] test_end_to_end_spec_prefill
-```
+# Run all spec-prefill test binaries
+./build/bin/test-spec-prefill --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./build/bin/test-spec-prefill-extended --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./build/bin/test-spec-prefill-integration --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./build/bin/test-spec-prefill-parity models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./build/bin/test-spec-prefill-quality models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
 ## C API Usage
 
@@ -48,10 +42,9 @@ llama_spec_prefill_context * sp_ctx = llama_spec_prefill_init(ctx_base, ctx_spec
 llama_token prompt[] = {1, 450, 2043, 338, 263};
 int n_prompt = 5;
 int n_lookahead = 8;
-float keep_ratio = 0.6f;  // keep 60% of tokens
-
+// keep_ratio defaults to 0.25 (25% kept) if not specified
 int n_filtered = llama_spec_prefill(
-    sp_ctx, prompt, n_prompt, n_lookahead, keep_ratio
+    sp_ctx, prompt, n_prompt, n_lookahead, 0.25f
 );
 
 // Use filtered prompt in base model...
@@ -77,8 +70,8 @@ llama_spec_prefill_free(sp_ctx);
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `n_lookahead` | Tokens to generate from draft | 8 |
-| `keep_ratio` | Fraction of prompt to keep | 0.6 (60%) |
-| `pool_kernel_size` | Importance smoothing kernel | 1 (disabled) |
+| `keep_ratio` | Fraction of prompt to keep | 0.25 (25%) |
+| `pool_kernel_size` | Importance smoothing kernel | 13 (vLLM default) |
 
 ## Requirements
 
@@ -114,14 +107,25 @@ To use spec prefill in your own application, call the C API directly (see usage 
 
 ## Implementation Status
 
-**POC** - Simplified implementation:
-- Q/K extraction is basic
-- Attention computation is basic
-- Full vLLM-style chunked filtering not yet implemented
+**POC — Proof of Concept**
+
+This is a simplified POC implementation of the speculative-prefill algorithm:
+- Q/K extraction: works via `get_gf_res_prev()` on spec model graph
+- Attention: **NO-OP** — importance scoring uses perplexity proxy instead
+- Chunked filtering: implemented with fallback to percentage strategy
+- Position preservation: tokens re-indexed to 0..n_kept-1 (RoPE limitation noted)
+
+**NOT production-ready**: The attention computation stub (no-op) means importance
+estimation relies entirely on the draft model's own confidence, not base-model
+attention. This is the primary gate for production release.
 
 ## Files
 
-- [`src/llama-spec-prefill.cpp`](src/llama-spec-prefill.cpp) - Core implementation
-- [`src/llama-spec-prefill.h`](src/llama-spec-prefill.h) - API header
-- [`tests/test-spec-prefill.cpp`](tests/test-spec-prefill.cpp) - Test suite
-- [`tests/test-spec-prefill-bench.cpp`](tests/test-spec-prefill-bench.cpp) - Benchmarks
+| File | Description |
+|------|-------------|
+| [`include/llama-spec-prefill.h`](include/llama-spec-prefill.h) | C API header (public) |
+| [`src/llama-spec-prefill.cpp`](src/llama-spec-prefill.cpp) | Core implementation |
+| [`examples/spec-prefill-run/main.cpp`](examples/spec-prefill-run/main.cpp) | CLI evaluation harness |
+| [`tests/test-spec-prefill*.cpp`](tests/) | 7 test binaries, 36+ tests |
+| [`tools/spec-prefill-*.py`](tools/) | 7 Python tool scripts |
+| [`tools/spec-prefill-parity-mock.sh`](tools/spec-prefill-parity-mock.sh) | C++ vs Python parity mock |

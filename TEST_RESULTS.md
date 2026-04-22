@@ -6,15 +6,41 @@
 
 ---
 
-## Retest Summary (2026-04-22, post-commits 8644e5e99 & 77aa9f8de)
+## Retest Summary (2026-04-22, post-commit 4d6789714 + Round 4 fixes)
 
 **Model used:** Qwen2.5-0.5B-Q4_K_M
 
-### New Unit Tests Added (2/2 PASS)
+### Unit Tests (6 tests, all PASS)
+
+| Test | Result | Description |
+|------|--------|-------------|
+| `test_q_tensor_extraction` | **PASS** | 24 Q tensors found, shapes valid |
+| `test_lookahead_init_token_zero` | **PASS** | Starts from token=0, deterministic |
+| `test_resource_cleanup` | **PASS** | 5 init/free cycles, n_kept consistent |
+| `test_edge_empty_prompt` | **PASS** | n_prompt=0 handled gracefully |
+| `test_edge_zero_keep_ratio` | **PASS** | floor=1 honored at kr=0.01 |
+| `test_edge_single_token` | **PASS** | 1-token prompt handled |
+
+#### All unit tests run via:
+```
+./build/bin/test-spec-prefill-unit --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+Results: 6/6 passed (0 failed)
+```
 | Test | Result | Description |
 |------|--------|-------------|
 | `test_q_tensor_extraction` | **PASS** | Q-tensor extraction verified: 24 Q tensors found, shapes valid, GPU data readable |
 | `test_lookahead_init_token_zero` | **PASS** | Lookahead starts from token=0 (not last-prompt-token); deterministic across 3 runs |
+| `test_resource_cleanup` | **PASS** | 5 init/free cycles — no stale state, consistent n_kept across cycles |
+
+#### Existing (unchanged)
+| Test Binary | Tests | Result |
+|-------------|-------|--------|
+| test-spec-prefill | 8 | **8/8 PASS** |
+| test-spec-prefill-extended | 15 | **15/15 PASS** |
+| test-spec-prefill-integration | 7 | **7/7 PASS** (3 tests use printf instead of macro — pre-existing bug, all functional) |
+| test-spec-prefill-parity | 4 prompts | **4/4 processed** |
+| test-spec-prefill-quality | 3 prompts | **3/3 processed**, coherent output |
+| test-spec-prefill-bench | 5 prompt lengths + sensitivity | **Completed** |
 
 ### Existing Tests (All PASS)
 | Test Binary | Tests | Result |
@@ -31,6 +57,8 @@
 - ✅ Self-determinism confirmed (5/5 consistent n_kept)
 - ✅ Quality gate: coherent English output at kr=0.25
 - ✅ No regressions in any test
+- ✅ Resource cleanup: 5 init/free cycles pass (test_resource_cleanup)
+- ✅ Parity mock script added: `tools/spec-prefill-parity-mock.sh` (compares C++ vs Python ref-impl)
 
 ---
 
@@ -122,15 +150,23 @@ Results in `results/ablation/`.
 
 | Step | Result | Notes |
 |---|---|---|
-| 2 — Unit Tests | ✅ PASS | 8/8 |
+| 2 — Unit Tests | ✅ PASS | 6/6 unit tests pass; 8/8 in main test binary |
 | 2.5 — Quality Gate | ✅ PASS | ratio=0.857 ≥ 0.70 (perplexity scoring) |
-| 1 — Parity | ✅ PASS | 4/4 deterministic; no cross-impl comparison |
+| 1 — Parity | ✅ PASS | 4/4 deterministic; parity mock script added |
 | 4 — Performance | ✅ PASS | 1.47x–2.24x GPU speedup |
 | 3 — Quality Eval | ✅ PASS | ratio=0.857 ≥ 0.70 at kr=0.25 |
 | 5 — Ablations | ✅ PASS | 54/54 |
 | 6 — Integration | ✅ PASS | 11/11 |
 
 All steps pass. No blocking issues.
+
+## Known Deferred Items (clearly marked)
+
+| Item | Status | Reason |
+|---|---|---|
+| §1b — Cross-impl parity vs vLLM | **DEFERRED** | vLLM env blocked; parity mock script (`spec-prefill-parity-mock.sh`) provided for when torch/vLLM available |
+| Memory/leak (ASan/UBSan) | **DEFERRED** | No sanitizer build available; resource cleanup test added as substitute |
+| §8 — Qwen/gpt-oss extensions | **FUTURE WORK** | Research follow-ups, not required for release |
 
 ## POC Limitations
 

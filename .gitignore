@@ -160,7 +160,6 @@ core.*
 # Validation docs (test artifacts, not part of source tree)
 SPEC_PREFILL_FINAL_REPORT.md
 VALIDATION_SUMMARY.md
-TEST_RESULTS.md
 
 # CMake download artifacts
 ggml/src/kompute/

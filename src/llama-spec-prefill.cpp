@@ -12,16 +12,16 @@
 #include <fstream>
 
 llama_spec_prefill_context * llama_spec_prefill_init(
-    llama_context * ctx_base,
-    llama_context * ctx_spec
+    struct llama_context * ctx_base,
+    struct llama_context * ctx_spec
 ) {
     llama_spec_prefill_params default_params;
     return llama_spec_prefill_init_with_params(ctx_base, ctx_spec, default_params);
 }
 
 llama_spec_prefill_context * llama_spec_prefill_init_with_params(
-    llama_context * ctx_base,
-    llama_context * ctx_spec,
+    struct llama_context * ctx_base,
+    struct llama_context * ctx_spec,
     const llama_spec_prefill_params & params
 ) {
     if (!ctx_base || !ctx_spec) {
@@ -389,19 +389,12 @@ int llama_spec_prefill_compute_attention(
     const llama_token * lookahead_tokens,
     int n_lookahead
 ) {
-    // Phase 4: Attention Computation (Proxy Implementation)
-    // Full implementation would use GGML ops: softmax(Q @ K^T / sqrt(d_k))
-    // For POC: Use prediction confidence as attention proxy
-    //   - High confidence (low entropy) = good context
-    //   - Low confidence (high entropy) = poor context
-    
+    // POC NO-OP: Returns 0. Importance scoring uses perplexity in
+    // compute_importance() instead. Full implementation would use GGML
+    // softmax(Q @ K^T / sqrt(d_k)) with base-model Q/K tensors.
     if (!ctx || !prompt_tokens || !lookahead_tokens || n_prompt <= 0 || n_lookahead <= 0) {
         return -1;
     }
-    
-    // Attention patterns implicitly captured in lookahead_stats
-    // Each lookahead position's entropy/confidence reflects how well
-    // the prompt tokens "attended" to it
     return 0;
 }
 
@@ -824,12 +817,14 @@ int llama_spec_prefill(
         return -1;
     }
 
-    // Step 3: Compute attention scores (simplified for POC)
-    if (llama_spec_prefill_compute_attention(
-            ctx, prompt_tokens, n_prompt, lookahead_tokens.data(), n_generated) != 0) {
-        fprintf(stderr, "[spec-prefill] step3 compute_attention failed\n");
-        return -1;
-    }
+    // Step 3: Compute attention scores — NO-OP in POC.
+    // Importance scoring uses perplexity-based proxy in compute_importance().
+    // Full implementation would compute softmax(Q @ K^T / sqrt(d_k)) with
+    // base-model Q/K tensors.  llama_spec_prefill_compute_attention() is a
+    // stub that always returns 0.
+    llama_spec_prefill_compute_attention(
+        ctx, prompt_tokens, n_prompt, lookahead_tokens.data(), n_generated
+    );  // no-op, return value ignored
 
     // Step 4: Compute token importance (with pooling applied inside)
     std::vector<float> token_importance;

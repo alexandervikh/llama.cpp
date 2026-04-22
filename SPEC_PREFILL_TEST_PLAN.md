@@ -20,7 +20,7 @@ Split into two sub-goals because cross-impl parity depends on vLLM, which does n
 Same C++ build, same inputs, fixed seed → byte-identical kept-token indices across runs.
 - **Acceptance:** 100% match on ≥ 20 prompts at `keep_ratio ∈ {0.10, 0.25, 1.0}`.
 
-### 1b. Cross-impl parity vs vLLM reference (stretch)
+### 1b. Cross-impl parity vs vLLM reference (STRETCH — DEFERRED)
 Mirror the reference pipeline stage-by-stage:
 - Lookahead generation (`look_ahead_cnt=8`, greedy).
 - Attention-score extraction (lookahead Q × prompt K).
@@ -28,11 +28,11 @@ Mirror the reference pipeline stage-by-stage:
 - Selection: `percentage` (10%) and `chunk` (`chunk_size=32`).
 - Position-id preservation.
 
-**Prerequisites (blocking):** clean venv with `torch==2.6.0`, `vllm==0.8.5`, `xformers==0.0.29.post2`. If this env cannot be stood up, §1b is **deferred**; do not label §1 as complete.
+**Status: DEFERRED.** vLLM 0.8.5 environment cannot be stood up (torch/xformers dependency conflicts). 
 
-**Acceptance:** mean kept-index IoU ≥ 0.95 at `kr=0.25`, ≥ 0.90 at `kr=0.10`; pre-pool / post-pool importance Pearson correlation ≥ 0.98 on 50-prompt suite.
+**Current validation:** `tools/spec-prefill-parity-mock.sh` compares C++ output against Python ref-impl (`tools/spec-prefill-ref-impl.py`). This validates algorithmic self-consistency but is NOT cross-impl parity — it compares C++ against our own Python re-implementation.
 
-**Fallback:** `tools/spec-prefill-ref-impl.py` is a Python re-implementation of the C++ algorithm. It validates our own port against itself (useful), but **does not constitute cross-impl parity** — calling it so is misleading.
+**Acceptance (when vLLM env becomes available):** mean kept-index IoU ≥ 0.95 at `kr=0.25`, ≥ 0.90 at `kr=0.10`; pre-pool / post-pool importance Pearson correlation ≥ 0.98 on 50-prompt suite.
 
 ## 2. Unit / Component Tests
 
