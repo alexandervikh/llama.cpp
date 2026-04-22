@@ -1,6 +1,5 @@
 #include "llama.h"
 #include "llama-spec-prefill.h"
-#include "../common/common.h"
 
 #include <cassert>
 #include <cstdio>
@@ -11,7 +10,6 @@
 #include <fstream>
 #include <sstream>
 
-// Simple JSON writing without external dependencies
 static void write_json_output(
     const std::string & path,
     int id,
@@ -26,7 +24,6 @@ static void write_json_output(
         return;
     }
 
-    // Escape output string for JSON
     std::string escaped;
     for (char c : output) {
         switch (c) {
@@ -45,7 +42,6 @@ static void write_json_output(
     f.close();
 }
 
-// Load prompts from JSONL file
 static std::vector<std::pair<int, std::string>> load_prompts(const std::string & path) {
     std::vector<std::pair<int, std::string>> prompts;
     std::ifstream f(path);
@@ -58,19 +54,17 @@ static std::vector<std::pair<int, std::string>> load_prompts(const std::string &
     while (std::getline(f, line)) {
         if (line.empty()) continue;
 
-        // Simple JSON parsing: extract "id" and "prompt" fields
         size_t id_pos = line.find("\"id\":");
         size_t prompt_pos = line.find("\"prompt\":");
 
         if (id_pos != std::string::npos && prompt_pos != std::string::npos) {
             int id = std::stoi(line.substr(id_pos + 5));
 
-            // Extract prompt string (everything between quotes after "prompt":)
-            size_t start = line.find('"', prompt_pos + 10);
+            size_t start = line.find('"', prompt_pos + 9);
             size_t end = line.rfind('"');
             if (start != std::string::npos && end > start) {
                 std::string prompt = line.substr(start + 1, end - start - 1);
-                // Unescape common JSON escapes
+                
                 size_t pos = 0;
                 while ((pos = prompt.find("\\n", pos)) != std::string::npos) {
                     prompt.replace(pos, 2, "\n");
@@ -84,47 +78,55 @@ static std::vector<std::pair<int, std::string>> load_prompts(const std::string &
     return prompts;
 }
 
-// Greedy decode: sample and generate text
 static std::string greedy_decode(
     llama_context * ctx,
     const llama_vocab * vocab,
-    int n_tokens_max
+    int n_tokens_max,
+    llama_token first_token,
+    int pos_start
 ) {
     std::string output;
-    llama_token last_token = llama_vocab_bos(vocab);
 
     auto sparams = llama_sampler_chain_default_params();
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
+    llama_batch batch = llama_batch_init(1, 0, 1);
+
+    llama_token new_token_id = first_token;
+
     for (int i = 0; i < n_tokens_max; i++) {
-        // Decode one step
-        llama_batch batch = llama_batch_get_one(&last_token, 1);
-        if (llama_decode(ctx, batch)) {
-            fprintf(stderr, "decode failed\n");
-            llama_batch_free(batch);
-            break;
-        }
-        llama_batch_free(batch);
+        batch.n_tokens      = 1;
+        batch.token[0]      = new_token_id;
+        batch.pos[0]        = (llama_pos)(pos_start + i);
+        batch.n_seq_id[0]   = 1;
+        batch.seq_id[0][0]  = 0;
+        batch.logits[0]     = 1;
 
-        // Sample next token
-        llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
-
-        // Check for end-of-generation
-        if (llama_vocab_is_eog(vocab, new_token_id)) {
+        int ret = llama_decode(ctx, batch);
+        if (ret != 0) {
+            fprintf(stderr, "decode failed at step %d, ret=%d, pos=%d\n", i, ret, pos_start + i);
             break;
         }
 
-        // Convert token to string
+        llama_token sampled = llama_sampler_sample(smpl, ctx, -1);
+        fprintf(stderr, "  [decode step %d] pos=%d sampled_token=%d\n", i, pos_start + i, sampled);
+
+        if (llama_vocab_is_eog(vocab, sampled)) {
+            fprintf(stderr, "  [decode step %d] EOS reached, stopping\n", i);
+            break;
+        }
+
         char buf[128];
-        int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+        int n = llama_token_to_piece(vocab, sampled, buf, sizeof(buf), 0, true);
         if (n > 0) {
             output.append(std::string(buf, n));
         }
 
-        last_token = new_token_id;
+        new_token_id = sampled;
     }
 
+    llama_batch_free(batch);
     llama_sampler_free(smpl);
     return output;
 }
@@ -136,45 +138,49 @@ static void run_quality_gate(
     const char * prompt_file,
     const char * out_file
 ) {
+    (void)spec_model_path;
     printf("Running quality gate with keep_ratio=%.2f\n", keep_ratio);
 
-    // Load models
     llama_model_params model_params = llama_model_default_params();
-    llama_model * model_base = llama_model_load_from_file(base_model_path, model_params);
-    llama_model * model_spec = llama_model_load_from_file(spec_model_path, model_params);
-
-    if (!model_base || !model_spec) {
-        fprintf(stderr, "Failed to load models\n");
+    llama_model * model = llama_model_load_from_file(base_model_path, model_params);
+    if (!model) {
+        fprintf(stderr, "Failed to load model from %s\n", base_model_path);
         return;
     }
 
-    // Create contexts
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 4096;
     ctx_params.n_batch = 2048;
 
-    llama_context * ctx_base = llama_init_from_model(model_base, ctx_params);
-    llama_context * ctx_spec = llama_init_from_model(model_spec, ctx_params);
-
-    if (!ctx_base || !ctx_spec) {
-        fprintf(stderr, "Failed to create contexts\n");
+    llama_context * ctx_base = llama_init_from_model(model, ctx_params);
+    if (!ctx_base) {
+        fprintf(stderr, "Failed to create base context\n");
+        llama_model_free(model);
         return;
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model_base);
+    llama_context * ctx_spec = llama_init_from_model(model, ctx_params);
+    if (!ctx_spec) {
+        fprintf(stderr, "Failed to create spec context\n");
+        llama_free(ctx_base);
+        llama_model_free(model);
+        return;
+    }
 
-    // Initialize spec-prefill context
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
     llama_spec_prefill_context * sp_ctx = llama_spec_prefill_init(ctx_base, ctx_spec);
     if (!sp_ctx) {
         fprintf(stderr, "Failed to init spec-prefill context\n");
+        llama_free(ctx_spec);
+        llama_free(ctx_base);
+        llama_model_free(model);
         return;
     }
 
-    // Clear output file
     std::ofstream clear_f(out_file, std::ios::trunc);
     clear_f.close();
 
-    // Load prompts
     auto prompts = load_prompts(prompt_file);
     printf("Loaded %zu prompts\n", prompts.size());
 
@@ -182,7 +188,6 @@ static void run_quality_gate(
     int n_decode = 64;
 
     for (const auto & [id, prompt_str] : prompts) {
-        // Tokenize prompt
         const int n_prompt = -llama_tokenize(vocab, prompt_str.c_str(), prompt_str.size(), nullptr, 0, true, true);
         if (n_prompt <= 0) {
             fprintf(stderr, "Tokenization failed for prompt %d\n", id);
@@ -195,33 +200,35 @@ static void run_quality_gate(
             continue;
         }
 
-        // Clear KV cache
-        llama_memory_t mem = llama_get_memory(ctx_base);
-        llama_memory_seq_rm(mem, 0, 0, -1);
-        mem = llama_get_memory(ctx_spec);
-        llama_memory_seq_rm(mem, 0, 0, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx_base), 0, 0, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx_spec), 0, 0, -1);
 
-        // Run spec-prefill pipeline
         int n_kept = llama_spec_prefill(
             sp_ctx, prompt_tokens.data(), n_prompt, n_lookahead, keep_ratio
         );
 
-        // Simple output: just the kept prompt text + marker
-        std::string output = "[SPEC-PREFILL OUTPUT - " + std::to_string(n_kept) + "/" + std::to_string(n_prompt) + " tokens kept]";
+        if (n_kept <= 0) {
+            fprintf(stderr, "spec-prefill returned n_kept=%d for prompt %d, skipping decode\n", n_kept, id);
+            std::string output = "[SPEC-PREFILL FAILED - n_kept=0]";
+            write_json_output(out_file, id, keep_ratio, output, 0, n_prompt);
+            continue;
+        }
 
-        // Write output
+        printf("  [%d/%zu] keep_ratio=%.2f, n_kept=%d, n_total=%d\n",
+               id + 1, prompts.size(), keep_ratio, n_kept, n_prompt);
+
+        // Use the last kept token as the first decode input
+        llama_token first_decode_token = prompt_tokens[n_kept - 1];
+        fprintf(stderr, "  [DEBUG] first_decode_token=%d, n_kept=%d\n", first_decode_token, n_kept);
+        std::string output = greedy_decode(ctx_base, vocab, n_decode, first_decode_token, n_kept);
+
         write_json_output(out_file, id, keep_ratio, output, n_kept, n_prompt);
-
-        printf("  [%d/%zu] keep_ratio=%.2f, n_kept=%d, n_total=%d, output_len=%zu\n",
-               id + 1, prompts.size(), keep_ratio, n_kept, n_prompt, output.length());
     }
 
-    // Cleanup
     llama_spec_prefill_free(sp_ctx);
-    llama_free(ctx_base);
     llama_free(ctx_spec);
-    llama_model_free(model_base);
-    llama_model_free(model_spec);
+    llama_free(ctx_base);
+    llama_model_free(model);
 
     printf("Quality gate complete. Results in: %s\n", out_file);
 }
@@ -233,7 +240,6 @@ int main(int argc, char ** argv) {
     const char * prompt_file = nullptr;
     const char * out_file = nullptr;
 
-    // Parse arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--base") == 0 && i + 1 < argc) {
             base_model_path = argv[++i];

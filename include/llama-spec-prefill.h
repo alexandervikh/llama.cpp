@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+struct ggml_tensor;
+
 // Lookahead generation statistics for importance scoring
 struct llama_lookahead_stat {
     float max_logit;    // Maximum logit value (prediction confidence)
@@ -31,14 +33,24 @@ struct llama_spec_prefill_params {
         ignore_eos(false) {}
 };
 
-// Speculative Prefill Context
+struct llama_spec_q_tensor {
+    int              layer_idx;
+    int64_t          n_embd_head_q;
+    int64_t          n_head;
+    int64_t          n_tokens;
+    const ggml_tensor * tensor_ptr;
+    std::vector<float> data;
+};
+
 struct llama_spec_prefill_context {
-    llama_context * ctx_base;  // Base model context
-    llama_context * ctx_spec;  // Speculative (smaller) model context
-    std::vector<llama_lookahead_stat> lookahead_stats;  // Statistics from lookahead generation
-    llama_spec_prefill_params params;  // Configuration parameters
-    int actual_lookahead_cnt;  // Actual number of lookahead tokens (may be less if EOS hit)
-    std::string dump_path;     // Optional path to dump parity traces (empty = disabled)
+    llama_context * ctx_base;
+    llama_context * ctx_spec;
+    std::vector<llama_lookahead_stat> lookahead_stats;
+    llama_spec_prefill_params params;
+    int actual_lookahead_cnt;
+    std::string dump_path;
+
+    std::vector<llama_spec_q_tensor> q_tensors;
 };
 
 // Initialize speculative prefill context

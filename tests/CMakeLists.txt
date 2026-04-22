@@ -270,6 +270,11 @@ unset(LLAMA_TEST_NAME)
 llama_build(test-spec-prefill.cpp)
 target_include_directories(test-spec-prefill PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+# Speculative prefill extended tests (15 cases including edge cases)
+unset(LLAMA_TEST_NAME)
+llama_build(test-spec-prefill-extended.cpp)
+target_include_directories(test-spec-prefill-extended PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 # Speculative prefill benchmark
 unset(LLAMA_TEST_NAME)
 llama_build(test-spec-prefill-bench.cpp)
@@ -284,3 +289,12 @@ target_include_directories(test-spec-prefill-quality PRIVATE ${PROJECT_SOURCE_DI
 unset(LLAMA_TEST_NAME)
 llama_build(test-importance-debug.cpp)
 target_include_directories(test-importance-debug PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+unset(LLAMA_TEST_NAME)
+llama_build(test-minimal-dual.cpp)
+target_include_directories(test-minimal-dual PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+# Speculative prefill integration & regression tests
+unset(LLAMA_TEST_NAME)
+llama_build(test-spec-prefill-integration.cpp)
+target_include_directories(test-spec-prefill-integration PRIVATE ${PROJECT_SOURCE_DIR}/include)

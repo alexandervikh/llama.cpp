@@ -129,10 +129,27 @@ static bool test_attention_score_extraction(const char * model_path) {
     
     llama_spec_prefill_context * sp_ctx = llama_spec_prefill_init(ctx_base, ctx_spec);
     
-    llama_token lookahead[] = {100, 200, 300};
     int n_lookahead = 3;
-    
-    int result = llama_spec_prefill_extract_qk(sp_ctx, lookahead, n_lookahead);
+    llama_token prompt[] = {1, 450, 2043, 338};
+    int n_prompt = 4;
+
+    // First generate lookahead tokens so the spec model has a computation graph
+    // with Q/K tensors to extract
+    std::vector<llama_token> gen_lookahead(n_lookahead);
+    int n_generated = llama_spec_prefill_generate_lookahead(
+        sp_ctx, prompt, n_prompt, gen_lookahead.data(), n_lookahead
+    );
+    if (n_generated <= 0) {
+        printf("  ✗ FAILED: generate_lookahead returned %d\n\n", n_generated);
+        llama_spec_prefill_free(sp_ctx);
+        llama_free(ctx_base);
+        llama_free(ctx_spec);
+        llama_free_model(model_base);
+        llama_free_model(model_spec);
+        return false;
+    }
+
+    int result = llama_spec_prefill_extract_qk(sp_ctx, gen_lookahead.data(), n_generated);
     
     bool success = (result == 0);
     

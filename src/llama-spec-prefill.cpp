@@ -1,8 +1,13 @@
 #include "llama-spec-prefill.h"
 #include "llama.h"
+#include "llama-graph.h"
+#include "llama-kv-cache.h"
+#include "llama-model.h"
+#include "llama-context.h"
 #include <vector>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <fstream>
 
@@ -100,7 +105,7 @@ int llama_spec_prefill_generate_lookahead(
     // Generate lookahead tokens using greedy sampling
     // Track logit statistics for importance scoring
     int n_generated = 0;
-    llama_token token = prompt_tokens[n_prompt - 1];
+    llama_token token = 0;
     ctx->lookahead_stats.resize(n_lookahead);
     ctx->actual_lookahead_cnt = n_lookahead;
 
@@ -174,22 +179,206 @@ int llama_spec_prefill_generate_lookahead(
     return n_generated;
 }
 
+// Helper: check if a tensor name matches Q/K tensor patterns
+static bool is_q_tensor_name(const char * name) {
+    if (!name || !name[0]) return false;
+    const char * p = name;
+    // Match "Qcur", "Qcur_normed", "Qcur_rope", "qcur", etc.
+    // Case-insensitive check for "Q" followed by "cur" or similar
+    if (p[0] != 'Q' && p[0] != 'q') return false;
+    // Must contain "cur" somewhere in the name
+    const char * cur_pos = nullptr;
+    for (const char * s = p; *s; ++s) {
+        if (*s == 'c' || *s == 'C') {
+            if ((*(s+1) == 'u' || *(s+1) == 'U') && (*(s+2) == 'r' || *(s+2) == 'R')) {
+                cur_pos = s;
+                break;
+            }
+        }
+    }
+    if (!cur_pos) return false;
+    // The char before 'C' should be 'Q' or 'q' (possibly with underscores)
+    for (const char * s = cur_pos - 1; s >= p; --s) {
+        if (*s == '_') continue;
+        if (*s == 'Q' || *s == 'q') return true;
+        return false;
+    }
+    return false;
+}
+
+static bool is_k_tensor_name(const char * name) {
+    if (!name || !name[0]) return false;
+    const char * p = name;
+    if (p[0] != 'K' && p[0] != 'k') return false;
+    const char * cur_pos = nullptr;
+    for (const char * s = p; *s; ++s) {
+        if (*s == 'c' || *s == 'C') {
+            if ((*(s+1) == 'u' || *(s+1) == 'U') && (*(s+2) == 'r' || *(s+2) == 'R')) {
+                cur_pos = s;
+                break;
+            }
+        }
+    }
+    if (!cur_pos) return false;
+    for (const char * s = cur_pos - 1; s >= p; --s) {
+        if (*s == '_') continue;
+        if (*s == 'K' || *s == 'k') return true;
+        return false;
+    }
+    return false;
+}
+
+static int extract_layer_index(const char * name) {
+    if (!name) return -1;
+    const char * p = name;
+    while (*p) {
+        if (*p == 'c' || *p == 'C' || *p == 'u' || *p == 'U' || *p == 'r' || *p == 'R') {
+            p++;
+            if (*p == '-') {
+                p++;
+                if (*p >= '0' && *p <= '9') {
+                    return atoi(p);
+                }
+                break;
+            }
+        } else {
+            p++;
+        }
+    }
+    return -1;
+}
+
+struct found_tensor {
+    const ggml_tensor * tensor;
+    int graph_idx;
+    bool is_q;
+};
+
+static void filter_best_per_layer(std::vector<found_tensor> & candidates, int n_layer) {
+    // Keep the last candidate (highest graph index) per layer
+    std::vector<found_tensor> best;
+    best.resize(n_layer);
+    for (auto & c : candidates) {
+        int li = extract_layer_index(c.tensor->name);
+        if (li >= 0 && li < n_layer) {
+            if (best[li].tensor == nullptr || c.graph_idx > best[li].graph_idx) {
+                best[li] = c;
+            }
+        }
+    }
+    candidates = std::move(best);
+}
+
 int llama_spec_prefill_extract_qk(
     llama_spec_prefill_context * ctx,
     const llama_token * lookahead_tokens,
     int n_lookahead
 ) {
-    // Phase 3: Q/K Extraction (Proxy Implementation)
-    // Full implementation would extract Q/K tensors from model internals
-    // For POC: Use lookahead generation statistics as attention proxy
-    // The logit distribution reflects which tokens the model "attends to"
-    
-    if (!ctx || !lookahead_tokens || n_lookahead <= 0) {
+    if (!ctx || !lookahead_tokens || n_lookahead <= 0 || !ctx->ctx_spec) {
         return -1;
     }
-    
-    // Statistics already captured during lookahead generation
-    // In ctx->lookahead_stats
+
+    ctx->ctx_spec->synchronize();
+    ctx->q_tensors.clear();
+
+    auto * gf_res = ctx->ctx_spec->get_gf_res_prev();
+    if (!gf_res) {
+        fprintf(stderr, "[spec-prefill] extract_qk: no graph result\n");
+        return -1;
+    }
+
+    auto * gf = gf_res->get_gf();
+    if (!gf) {
+        fprintf(stderr, "[spec-prefill] extract_qk: no computation graph\n");
+        return -1;
+    }
+
+    const int n_layer = (int)llama_model_n_layer(&ctx->ctx_spec->get_model());
+    const int n_nodes = ggml_graph_n_nodes(gf);
+
+    std::vector<found_tensor> q_candidates;
+    std::vector<found_tensor> k_candidates;
+
+    for (int j = 0; j < n_nodes; j++) {
+        ggml_tensor * t = ggml_graph_node(gf, j);
+        if (!t || !t->name[0]) continue;
+        if (ggml_n_dims(t) < 2) continue;
+        if (t->ne[0] < 16 || t->ne[0] > 4096) continue;
+        if (t->ne[1] < 1 || t->ne[1] > 128) continue;
+
+        if (is_q_tensor_name(t->name)) {
+            q_candidates.push_back({t, j, true});
+        } else if (is_k_tensor_name(t->name)) {
+            k_candidates.push_back({t, j, false});
+        } else if (strstr(t->name, "Kcur")) {
+            fprintf(stderr, "[spec-prefill] extract_qk: found Kcur tensor but rejected: '%s' shape=[%ld,%ld,%ld] dims=%d is_k=%d\n",
+                    t->name, (long)t->ne[0], (long)t->ne[1], (long)t->ne[2],
+                    ggml_n_dims(t), (int)is_k_tensor_name(t->name));
+        }
+    }
+
+    filter_best_per_layer(q_candidates, n_layer);
+    filter_best_per_layer(k_candidates, n_layer);
+
+    fprintf(stderr, "[spec-prefill] extract_qk: found %zu Q candidates, %zu K candidates\n",
+            q_candidates.size(), k_candidates.size());
+
+    const int n_q_to_use = (int)std::min((size_t)n_layer, q_candidates.size());
+    if (n_q_to_use == 0) {
+        fprintf(stderr, "[spec-prefill] extract_qk: no Q tensors found in graph (n_nodes=%d), proceeding with empty tensors\n", n_nodes);
+        return 0;
+    }
+
+    int extracted = 0;
+    for (int qi = 0; qi < n_q_to_use; qi++) {
+        const ggml_tensor * t = q_candidates[qi].tensor;
+        if (!t) {
+            fprintf(stderr, "[spec-prefill] extract_qk: Q[%d] tensor ptr is NULL (graph may be stale)\n", qi);
+            continue;
+        }
+
+        llama_spec_q_tensor q_info;
+        q_info.layer_idx = qi;
+        q_info.n_embd_head_q = t->ne[0];
+        q_info.n_head = t->ne[1];
+        q_info.n_tokens = t->ne[2];
+        q_info.tensor_ptr = t;
+
+        const int64_t n_elements = (int64_t)t->ne[0] * t->ne[1] * t->ne[2];
+        if (n_elements <= 0) {
+            fprintf(stderr, "[spec-prefill] extract_qk: Q[%d] invalid n_elements=%ld\n", qi, (long)n_elements);
+            continue;
+        }
+
+        q_info.data.resize(n_elements);
+
+        // Copy tensor data from GPU to CPU, then convert to float if needed
+        const size_t nbytes = ggml_nbytes(t);
+        std::vector<uint8_t> cpu_buf(nbytes);
+        ggml_backend_tensor_get(t, cpu_buf.data(), 0, nbytes);
+
+        if (t->type == GGML_TYPE_F32) {
+            std::memcpy(q_info.data.data(), cpu_buf.data(), nbytes);
+        } else {
+            const auto * type_traits = ggml_get_type_traits(t->type);
+            if (type_traits && type_traits->to_float != NULL) {
+                type_traits->to_float(cpu_buf.data(), q_info.data.data(), n_elements);
+            } else {
+                fprintf(stderr, "[spec-prefill] extract_qk: unsupported type %d for Q il=%d\n", t->type, qi);
+                continue;
+            }
+        }
+
+        ctx->q_tensors.push_back(q_info);
+        extracted++;
+    }
+
+    if (extracted == 0) {
+        fprintf(stderr, "[spec-prefill] extract_qk: failed to extract any Q tensor data (all tensors NULL or invalid)\n");
+        return -1;
+    }
+
+    fprintf(stderr, "[spec-prefill] extract_qk: successfully extracted %d Q tensors\n", extracted);
     return 0;
 }
 
@@ -453,71 +642,114 @@ int llama_spec_prefill_filter_tokens_chunked(
     // 2. Compute average importance per chunk
     // 3. Keep top-k chunks
     // 4. Include all tokens from kept chunks
-    
+
     if (!ctx || !prompt_tokens || !prompt_positions || n_prompt <= 0) {
         return -1;
     }
-    
+
     if (token_importance.size() != (size_t)n_prompt) {
         return -1;
     }
-    
+
     if (chunk_size <= 0) {
-        chunk_size = 32;  // Default like vLLM
+        chunk_size = 32;
     }
-    
+
     // Calculate number of chunks
     int n_chunks = (n_prompt + chunk_size - 1) / chunk_size;
-    
+
     // Compute average importance for each chunk
     std::vector<std::pair<float, int>> chunk_importance;
     chunk_importance.reserve(n_chunks);
-    
+
     for (int c = 0; c < n_chunks; c++) {
         int start = c * chunk_size;
         int end = std::min(start + chunk_size, n_prompt);
-        
+
         float avg = 0.0f;
         for (int i = start; i < end; i++) {
             avg += token_importance[i];
         }
         avg /= (end - start);
-        
+
         chunk_importance.push_back({avg, c});
     }
-    
+
     // Sort chunks by importance (descending)
     std::sort(chunk_importance.begin(), chunk_importance.end(),
         [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
             return a.first > b.first;
         });
-    
+
     // Calculate how many chunks to keep
     int n_keep_chunks = (int)std::ceil(n_chunks * keep_ratio);
     if (n_keep_chunks < 1) n_keep_chunks = 1;
     if (n_keep_chunks > n_chunks) n_keep_chunks = n_chunks;
-    
-    // Get indices of chunks to keep
+
+    // Calculate target number of tokens to keep (minimum guarantee)
+    int n_target = (int)(n_prompt * keep_ratio);
+    if (n_target < 1) n_target = 1;
+
     std::vector<int> kept_chunk_indices;
     kept_chunk_indices.reserve(n_keep_chunks);
     for (int i = 0; i < n_keep_chunks; i++) {
         kept_chunk_indices.push_back(chunk_importance[i].second);
     }
-    
-    // Sort chunk indices to maintain order
+
     std::sort(kept_chunk_indices.begin(), kept_chunk_indices.end());
-    
-    // Collect all tokens from kept chunks
+
     filtered_tokens.clear();
     filtered_positions.clear();
-    
+    std::vector<bool> token_kept(n_prompt, false);
+    int tokens_kept = 0;
+
     for (int c : kept_chunk_indices) {
         int start = c * chunk_size;
         int end = std::min(start + chunk_size, n_prompt);
-        
+
         for (int i = start; i < end; i++) {
             filtered_tokens.push_back(prompt_tokens[i]);
             filtered_positions.push_back(prompt_positions[i]);
+            token_kept[i] = true;
+            tokens_kept++;
+        }
+    }
+
+    // Fallback: if chunks don't provide enough tokens, fill from remaining high-importance tokens
+    if (tokens_kept < n_target) {
+        std::vector<std::pair<float, int>> remaining;
+        remaining.reserve(n_prompt - tokens_kept);
+        for (int i = 0; i < n_prompt; i++) {
+            if (!token_kept[i]) {
+                remaining.push_back({token_importance[i], i});
+            }
+        }
+        std::sort(remaining.begin(), remaining.end(),
+            [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                return a.first > b.first;
+            });
+
+        int fill_count = n_target - tokens_kept;
+        std::vector<int> fill_indices;
+        fill_indices.reserve(fill_count);
+        for (int i = 0; i < fill_count && i < (int)remaining.size(); i++) {
+            fill_indices.push_back(remaining[i].second);
+        }
+
+        std::sort(fill_indices.begin(), fill_indices.end());
+
+        std::vector<bool> is_fill(n_prompt, false);
+        for (int idx : fill_indices) {
+            is_fill[idx] = true;
+        }
+
+        filtered_tokens.clear();
+        filtered_positions.clear();
+        for (int i = 0; i < n_prompt; i++) {
+            if (token_kept[i] || is_fill[i]) {
+                filtered_tokens.push_back(prompt_tokens[i]);
+                filtered_positions.push_back(prompt_positions[i]);
+            }
         }
     }
 
