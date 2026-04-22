@@ -2,6 +2,8 @@
 
 Speculative prefill optimizes the **prompt processing phase** by selectively filtering tokens based on importance scores, reducing computation while preserving model quality.
 
+based on: https://github.com/Jingyu6/speculative_prefill 
+
 ## How It Works
 
 1. **Generate lookahead tokens** using a draft model
