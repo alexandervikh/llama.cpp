@@ -138,3 +138,29 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Core dumps
+core.*
+
+# CTest testing output
+/Testing/
+
+# Local tooling metadata
+/.claude/
+/.sisyphus/
+
+# Test artifacts (non-essential)
+/tests/prompts_simple.jsonl
+/tests/sample_prompts.jsonl
+/tests/quality_kr1.0.jsonl
+/tests/debug_prompt_load.cpp
+/tests/prompts_harmony.jsonl
+/tests/prompts_parity.jsonl
+
+# Validation docs (test artifacts, not part of source tree)
+SPEC_PREFILL_FINAL_REPORT.md
+VALIDATION_SUMMARY.md
+TEST_RESULTS.md
+
+# CMake download artifacts
+ggml/src/kompute/

@@ -294,6 +294,11 @@ unset(LLAMA_TEST_NAME)
 llama_build(test-minimal-dual.cpp)
 target_include_directories(test-minimal-dual PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+   # Speculative prefill unit tests (Q-tensor + lookahead init regression)
+unset(LLAMA_TEST_NAME)
+llama_build(test-spec-prefill-unit.cpp)
+target_include_directories(test-spec-prefill-unit PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 # Speculative prefill integration & regression tests
 unset(LLAMA_TEST_NAME)
 llama_build(test-spec-prefill-integration.cpp)
