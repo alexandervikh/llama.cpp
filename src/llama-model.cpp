@@ -8033,6 +8033,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm;
 
+    // Partial-layer graph: only Llama (non-iSWA) is supported. All other archs fall
+    // through to their full builders below (which is also fine when il_start==0 and
+    // il_end==n_layer, i.e. the partial bounds are the trivial "everything" range).
+    if (params.gtype == LLM_GRAPH_TYPE_PARTIAL) {
+        const bool can_partial =
+            arch == LLM_ARCH_LLAMA ||
+            (arch == LLM_ARCH_LLAMA4 && hparams.swa_type == LLAMA_SWA_TYPE_NONE);
+        if (can_partial) {
+            llm = std::make_unique<llm_build_llama_partial>(*this, params);
+            llm->res->set_params(params);
+            return llm->res->get_gf();
+        }
+        // Unsupported arch for partial decode: fall through to full builders.
+    }
+
     switch (arch) {
         case LLM_ARCH_LLAMA:
             {

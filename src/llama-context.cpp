@@ -1625,7 +1625,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, decode_gtype, mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1811,6 +1811,50 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     return 0;
+}
+
+int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end) {
+    const int32_t n_layer_total = (int32_t) model.hparams.n_layer;
+
+    if (il_end < 0) il_end = n_layer_total;
+    if (il_start < 0 || il_start > il_end || il_end > n_layer_total) {
+        LLAMA_LOG_ERROR("%s: invalid layer range [%d, %d), n_layer=%d\n",
+                __func__, il_start, il_end, n_layer_total);
+        return -1;
+    }
+
+    const bool is_resume = (il_start > 0);
+    if (is_resume && (!batch_inp.embd || batch_inp.token)) {
+        LLAMA_LOG_ERROR("%s: il_start>0 requires batch.embd!=nullptr and batch.token==nullptr\n",
+                __func__);
+        return -1;
+    }
+    if (!is_resume && (!batch_inp.token || batch_inp.embd)) {
+        LLAMA_LOG_ERROR("%s: il_start==0 requires batch.token!=nullptr and batch.embd==nullptr\n",
+                __func__);
+        return -1;
+    }
+
+    const bool last_chunk = (il_end == n_layer_total);
+
+    partial_il_start_pending = il_start;
+    partial_il_end_pending   = il_end;
+    decode_gtype             = LLM_GRAPH_TYPE_PARTIAL;
+
+    // Force embeddings extraction whenever the chunk does not end at the model output;
+    // otherwise standard logits-only behaviour. Restore on exit.
+    const bool save_embeddings = cparams.embeddings;
+    if (!last_chunk) {
+        cparams.embeddings = true;
+    }
+
+    const int r = decode(batch_inp);
+
+    cparams.embeddings        = save_embeddings;
+    decode_gtype              = LLM_GRAPH_TYPE_DECODER;
+    partial_il_start_pending  = 0;
+    partial_il_end_pending    = -1;
+    return r;
 }
 
 //
@@ -2097,7 +2141,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params p = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2114,6 +2158,11 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    if (gtype == LLM_GRAPH_TYPE_PARTIAL) {
+        p.il_start = partial_il_start_pending;
+        p.il_end   = partial_il_end_pending;
+    }
+    return p;
 }
 
 ggml_status llama_context::graph_compute(

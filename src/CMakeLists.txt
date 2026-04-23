@@ -33,6 +33,7 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-spec-prefill.cpp
+            llama-self-layer-prefill.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
@@ -92,6 +93,7 @@ add_library(llama
             models/llada.cpp
             models/llama-iswa.cpp
             models/llama.cpp
+            models/llama-partial.cpp
             models/maincoder.cpp
             models/mamba.cpp
             models/mimo2-iswa.cpp

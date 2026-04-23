@@ -1,0 +1,23 @@
+{
+  "model": "models/llama-3.1-8b-instruct-q4_k_m.gguf",
+  "n_layer": 32,
+  "n_early_default": 8,
+  "n_ctx": 4096,
+  "n_batch": 4096,
+  "n_gpu_layers": -1,
+  "runs": 3,
+  "results": [
+    {"n_prompt":512,"keep_ratio":0.1,"baseline_prefill_ms_avg":198.29,"attention_profile_ms_avg":424.79,"e2e_self_layer_ms_avg":459.79,"kv_prune_ms_avg":408.68,"partial_self_layer_ms_avg":133.54,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":51,"n_kept_kvprune_last_repeat":52,"n_kept_partial_last_repeat":51},
+    {"n_prompt":512,"keep_ratio":0.2500,"baseline_prefill_ms_avg":196.95,"attention_profile_ms_avg":430.56,"e2e_self_layer_ms_avg":476.93,"kv_prune_ms_avg":409.32,"partial_self_layer_ms_avg":150.04,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":128,"n_kept_kvprune_last_repeat":128,"n_kept_partial_last_repeat":128},
+    {"n_prompt":512,"keep_ratio":0.5000,"baseline_prefill_ms_avg":197.54,"attention_profile_ms_avg":425.15,"e2e_self_layer_ms_avg":520.11,"kv_prune_ms_avg":407.24,"partial_self_layer_ms_avg":193.36,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":256,"n_kept_kvprune_last_repeat":256,"n_kept_partial_last_repeat":256},
+    {"n_prompt":512,"keep_ratio":1.0000,"baseline_prefill_ms_avg":196.63,"attention_profile_ms_avg":426.56,"e2e_self_layer_ms_avg":625.22,"kv_prune_ms_avg":408.52,"partial_self_layer_ms_avg":196.59,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":512,"n_kept_kvprune_last_repeat":512,"n_kept_partial_last_repeat":512},
+    {"n_prompt":2048,"keep_ratio":0.1000,"baseline_prefill_ms_avg":1154.30,"attention_profile_ms_avg":2334.28,"e2e_self_layer_ms_avg":2431.30,"kv_prune_ms_avg":2270.51,"partial_self_layer_ms_avg":668.43,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":204,"n_kept_kvprune_last_repeat":204,"n_kept_partial_last_repeat":205},
+    {"n_prompt":2048,"keep_ratio":0.2500,"baseline_prefill_ms_avg":1163.86,"attention_profile_ms_avg":2354.17,"e2e_self_layer_ms_avg":2548.50,"kv_prune_ms_avg":2276.43,"partial_self_layer_ms_avg":830.07,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":512,"n_kept_kvprune_last_repeat":512,"n_kept_partial_last_repeat":513},
+    {"n_prompt":2048,"keep_ratio":0.5000,"baseline_prefill_ms_avg":1162.20,"attention_profile_ms_avg":2340.53,"e2e_self_layer_ms_avg":2839.85,"kv_prune_ms_avg":2274.09,"partial_self_layer_ms_avg":1135.10,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":1024,"n_kept_kvprune_last_repeat":1024,"n_kept_partial_last_repeat":1025},
+    {"n_prompt":2048,"keep_ratio":1.0000,"baseline_prefill_ms_avg":1155.97,"attention_profile_ms_avg":2366.02,"e2e_self_layer_ms_avg":3509.37,"kv_prune_ms_avg":2284.91,"partial_self_layer_ms_avg":1155.91,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":2048,"n_kept_kvprune_last_repeat":2048,"n_kept_partial_last_repeat":2048},
+    {"n_prompt":4096,"keep_ratio":0.1000,"baseline_prefill_ms_avg":3255.94,"attention_profile_ms_avg":5668.75,"e2e_self_layer_ms_avg":5826.74,"kv_prune_ms_avg":5498.25,"partial_self_layer_ms_avg":1636.60,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":409,"n_kept_kvprune_last_repeat":409,"n_kept_partial_last_repeat":409},
+    {"n_prompt":4096,"keep_ratio":0.2500,"baseline_prefill_ms_avg":3260.76,"attention_profile_ms_avg":5682.66,"e2e_self_layer_ms_avg":6169.08,"kv_prune_ms_avg":5544.93,"partial_self_layer_ms_avg":1978.22,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":1024,"n_kept_kvprune_last_repeat":1024,"n_kept_partial_last_repeat":1024},
+    {"n_prompt":4096,"keep_ratio":0.5000,"baseline_prefill_ms_avg":3265.57,"attention_profile_ms_avg":5694.27,"e2e_self_layer_ms_avg":6850.78,"kv_prune_ms_avg":5551.44,"partial_self_layer_ms_avg":2641.16,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":2048,"n_kept_kvprune_last_repeat":2048,"n_kept_partial_last_repeat":2048},
+    {"n_prompt":4096,"keep_ratio":1.0000,"baseline_prefill_ms_avg":3252.21,"attention_profile_ms_avg":5687.82,"e2e_self_layer_ms_avg":8945.43,"kv_prune_ms_avg":5559.39,"partial_self_layer_ms_avg":3261.96,"pearson_shallow_vs_full_avg":1.0000,"pearson_shallow_vs_deep_avg":1.0000,"n_kept_last_repeat":4096,"n_kept_kvprune_last_repeat":4096,"n_kept_partial_last_repeat":4096}
+  ]
+}

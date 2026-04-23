@@ -390,6 +390,14 @@ struct llm_build_llama_iswa : public llm_graph_context {
     llm_build_llama_iswa(const llama_model & model, const llm_graph_params & params);
 };
 
+// Partial layer-range Llama graph for self-layer prefill. See SELF_LAYER_PREFILL_PLAN.md
+// and llm_graph_params::il_start / il_end. When il_start > 0 the residual stream input
+// comes from ubatch.embd; when il_end < n_layer the output is the residual after layer
+// (il_end-1) exposed as res->t_embd (no output norm, no lm_head).
+struct llm_build_llama_partial : public llm_graph_context {
+    llm_build_llama_partial(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_maincoder : public llm_graph_context {
     llm_build_maincoder(const llama_model & model, const llm_graph_params & params);
 };

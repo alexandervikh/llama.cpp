@@ -133,6 +133,22 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // Partial layer-range decode for self-layer-prefill (LLM_GRAPH_TYPE_PARTIAL).
+    // - When il_start > 0, batch_inp must carry embeddings (token=null, embd!=null).
+    //   The embedding layer is bypassed and embd is used as the residual stream feeding
+    //   layer il_start. Otherwise the normal token path runs.
+    // - When il_end < n_layer, output norm + lm_head are skipped; the residual stream
+    //   after layer (il_end-1) is exposed as t_embd and copied into ctx->embd buffer
+    //   (one row per output token).
+    // Note: only LLM_ARCH_LLAMA / LLAMA4 (single-graph variant) is supported. Other
+    // archs return -3.
+    int decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end);
+
+    // Hidden-state slot for cross-call partial decode.
+    int32_t partial_il_start_pending = 0;
+    int32_t partial_il_end_pending   = -1;
+    llm_graph_type decode_gtype      = LLM_GRAPH_TYPE_DECODER;
+
     //
     // state save/load
     //

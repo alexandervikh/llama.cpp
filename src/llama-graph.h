@@ -31,6 +31,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_PARTIAL,   // partial layer-range execution; see llm_graph_params::il_start/il_end
 };
 
 enum llm_ffn_op_type {
@@ -557,6 +558,15 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // Partial layer-range execution (used when gtype == LLM_GRAPH_TYPE_PARTIAL).
+    // - il_start > 0: skip token embedding lookup; ubatch.embd is treated as the
+    //   residual-stream input that feeds layer il_start.
+    // - il_end < n_layer: skip output norm + lm_head; the residual stream after
+    //   layer (il_end-1) is exposed as res->t_embd.
+    // Defaults select the full model (legacy behaviour for non-PARTIAL graphs).
+    int32_t il_start = 0;
+    int32_t il_end   = -1;     // -1 means n_layer
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -615,11 +625,13 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
-            arch  == other.arch  &&
-            gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+            arch     == other.arch     &&
+            gtype    == other.gtype    &&
+            il_start == other.il_start &&
+            il_end   == other.il_end   &&
+            cvec     == other.cvec     &&
+            loras    == other.loras    &&
+            cross    == other.cross;
     }
 };
 
