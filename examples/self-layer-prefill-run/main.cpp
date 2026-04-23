@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <csignal>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
@@ -23,6 +25,10 @@ struct Args {
     int pool = 13;
     bool chunking = false;
     int chunk_size = 32;
+    int bench_min_prompt = 0;
+    bool multi_gpu = false;       // use multiple GPUs via layer split
+    double timeout_sec = 300.0;   // max seconds per operation before skip
+    bool verbose = true;          // print progress to stderr
 };
 
 static double now_ms() {
@@ -31,29 +37,58 @@ static double now_ms() {
         .count();
 }
 
+static void log_progress(bool verbose, const char * fmt, ...) {
+    if (!verbose) return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fflush(stderr);
+}
+
 static void usage() {
     std::cerr
         << "llama-self-layer-prefill-run\n"
         << "  --model <gguf>           (required)\n"
         << "  --mode bench|once        (default: bench)\n"
-        << "  --n-ctx <n>              (default 8192; must be >= prompt len)\n"
-        << "  --n-batch <n>           (default 8192; must be >= prompt len for Q/K extract)\n"
-        << "  --n-gpu-layers <n>     (0=CPU-only, -1=all layers GPU; default -1)\n"
-        << "  --n-early <n>           (shallow layer count; default L/4)\n"
-        << "  --keep-ratio <f>        (for end-to-end prefill; bench sweeps several)\n"
-        << "  --pool <n>              (pool kernel, default 13)\n"
-        << "  --chunking              (chunk-based filter)\n"
-        << "  --chunk-size <n>        (default 32)\n"
-        << "  --n-warmup <n>          (default 1)\n"
-        << "  --n-repeat <n>          (default 3)\n";
+        << "  --n-ctx <n>              (default 8192)\n"
+        << "  --n-batch <n>            (default 8192)\n"
+        << "  --n-gpu-layers <n>       (0=CPU-only, -1=all GPU; default -1)\n"
+        << "  --n-early <n>            (shallow layer count; default L/4)\n"
+        << "  --keep-ratio <f>         (for end-to-end prefill; bench sweeps several)\n"
+        << "  --pool <n>               (pool kernel, default 13)\n"
+        << "  --chunking               (chunk-based filter)\n"
+        << "  --chunk-size <n>         (default 32)\n"
+        << "  --n-warmup <n>           (default 1)\n"
+        << "  --n-repeat <n>           (default 3)\n"
+        << "  --bench-min-prompt <n>   (bench only: skip n_prompt < n; default 0)\n"
+        << "  --multi-gpu              (use layer split across GPUs; default: single GPU)\n"
+        << "  --timeout <sec>          (max seconds per op before skip; default 300)\n"
+        << "  --quiet                  (suppress progress to stderr)\n";
 }
 
-static std::vector<llama_token> make_prompt(const llama_vocab * vocab, int n_tok) {
-    std::vector<llama_token> toks((size_t) n_tok);
-    for (int i = 0; i < n_tok; i++) {
-        toks[(size_t) i] = 1000 + (i % 256);
-    }
+// More realistic prompt: repeated paragraph of varying content (like doc retrieval)
+static std::vector<llama_token> make_realistic_prompt(const llama_vocab * vocab, int n_tok) {
     (void) vocab;
+    std::vector<llama_token> toks;
+    toks.reserve((size_t) n_tok);
+    // Simulate document with headers, paragraphs, varying token IDs
+    // Token IDs 1000-9999 to avoid special tokens
+    int para_len = 128;
+    int header_len = 8;
+    int para_idx = 0;
+    for (int i = 0; i < n_tok; ) {
+        // Header tokens (low IDs)
+        for (int h = 0; h < header_len && i < n_tok; h++, i++) {
+            toks.push_back((llama_token)(1000 + (para_idx * 17 + h) % 500));
+        }
+        // Paragraph tokens (higher IDs, more variation)
+        for (int p = 0; p < para_len && i < n_tok; p++, i++) {
+            int base = 2000 + (para_idx % 10) * 500;
+            toks.push_back((llama_token)(base + (p * 31 + para_idx * 7) % 500));
+        }
+        para_idx++;
+    }
     return toks;
 }
 
@@ -85,6 +120,14 @@ int main(int argc, char ** argv) {
             args.n_warmup = std::stoi(argv[++i]);
         } else if (a == "--n-repeat" && i + 1 < argc) {
             args.n_repeat = std::stoi(argv[++i]);
+        } else if (a == "--bench-min-prompt" && i + 1 < argc) {
+            args.bench_min_prompt = std::stoi(argv[++i]);
+        } else if (a == "--multi-gpu") {
+            args.multi_gpu = true;
+        } else if (a == "--timeout" && i + 1 < argc) {
+            args.timeout_sec = std::stod(argv[++i]);
+        } else if (a == "--quiet") {
+            args.verbose = false;
         } else {
             usage();
             return 1;
@@ -95,35 +138,67 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    log_progress(args.verbose, "[init] Loading model: %s\n", args.model_path.c_str());
+    log_progress(args.verbose, "[init] n_ctx=%d, n_batch=%d, n_gpu_layers=%d, multi_gpu=%s\n",
+                 args.n_ctx, args.n_batch, args.n_gpu_layers, args.multi_gpu ? "yes" : "no");
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = args.n_gpu_layers;
-    // Single-device graphs: required for stable ggml_backend_tensor_get of Qcur/Kcur.
+
+    // GPU split mode: NONE for single GPU (required for Q/K tensor readback stability),
+    // LAYER for multi-GPU (distributes layers across devices)
     if (args.n_gpu_layers != 0) {
-        mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+        if (args.multi_gpu) {
+            mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            log_progress(args.verbose, "[init] Using LLAMA_SPLIT_MODE_LAYER (multi-GPU)\n");
+        } else {
+            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+            log_progress(args.verbose, "[init] Using LLAMA_SPLIT_MODE_NONE (single GPU)\n");
+        }
     }
+
+    double t_load_start = now_ms();
     llama_model * model = llama_model_load_from_file(args.model_path.c_str(), mparams);
+    double t_load_end = now_ms();
     if (!model) {
         std::cerr << "Failed to load model\n";
         return 1;
     }
+    log_progress(args.verbose, "[init] Model loaded in %.1f ms\n", t_load_end - t_load_start);
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_layer = (int) llama_model_n_layer(model);
     const int n_early = args.n_early > 0 ? args.n_early : std::max(1, n_layer / 4);
+    log_progress(args.verbose, "[init] n_layer=%d, n_early=%d\n", n_layer, n_early);
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = (uint32_t) std::max(512, args.n_ctx);
     cparams.n_batch = (uint32_t) std::max(512, args.n_batch);
-    cparams.n_ubatch = cparams.n_batch; // single-shot prefill: ubatch == batch so Q/K live in one graph
+    cparams.n_ubatch = cparams.n_batch;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
+    log_progress(args.verbose, "[init] Creating context (n_ctx=%u, n_batch=%u, FA=disabled)...\n",
+                 cparams.n_ctx, cparams.n_batch);
+    double t_ctx_start = now_ms();
     llama_context * ctx = llama_init_from_model(model, cparams);
+    double t_ctx_end = now_ms();
     if (!ctx) {
-        std::cerr << "Failed to create context\n";
+        std::cerr << "Failed to create context (likely OOM during graph_reserve)\n";
         llama_model_free(model);
         return 1;
     }
+    log_progress(args.verbose, "[init] Context created in %.1f ms\n", t_ctx_end - t_ctx_start);
 
-    auto run_baseline = [&](const std::vector<llama_token> & toks) {
+    const double timeout_ms = args.timeout_sec * 1000.0;
+
+    // Helper: run with timeout check (returns {result, elapsed_ms, timed_out})
+    struct TimedResult {
+        int result;
+        double elapsed_ms;
+        bool timed_out;
+    };
+
+    auto run_baseline = [&](const std::vector<llama_token> & toks) -> TimedResult {
         llama_memory_clear(llama_get_memory(ctx), false);
         const int n = (int) toks.size();
         llama_batch b = llama_batch_init(n, 0, 1);
@@ -142,50 +217,21 @@ int main(int argc, char ** argv) {
         llama_synchronize(ctx);
         double t1 = now_ms();
         llama_batch_free(b);
-        return std::make_pair(r, t1 - t0);
+        return {r, t1 - t0, false};
     };
 
-    auto run_profiles = [&](const std::vector<llama_token> & toks, llama_self_layer_prefill_params & P, float * p_sf, float * p_sd) {
-        std::vector<float> shallow, deep, full;
-        llama_synchronize(ctx);
-        double t0 = now_ms();
-        const int r = llama_self_layer_prefill_attention_profiles(
-            ctx, toks.data(), (int) toks.size(), &P, shallow, deep, full, p_sf, p_sd);
-        llama_synchronize(ctx);
-        double t1 = now_ms();
-        return std::make_pair(r, t1 - t0);
-    };
-
-    auto run_e2e = [&](const std::vector<llama_token> & toks, llama_self_layer_prefill_params & P) {
-        llama_synchronize(ctx);
-        double t0 = now_ms();
-        const int n_kept = llama_self_layer_prefill(ctx, toks.data(), (int) toks.size(), &P);
-        llama_synchronize(ctx);
-        double t1 = now_ms();
-        return std::make_pair(n_kept, t1 - t0);
-    };
-
-    auto run_kvprune = [&](const std::vector<llama_token> & toks, llama_self_layer_prefill_params & P) {
-        llama_synchronize(ctx);
-        double t0 = now_ms();
-        const int n_kept = llama_self_layer_prefill_with_kv_prune(ctx, toks.data(), (int) toks.size(), &P);
-        llama_synchronize(ctx);
-        double t1 = now_ms();
-        return std::make_pair(n_kept, t1 - t0);
-    };
-
-    auto run_partial = [&](const std::vector<llama_token> & toks, llama_self_layer_prefill_params & P) {
+    auto run_partial = [&](const std::vector<llama_token> & toks, llama_self_layer_prefill_params & P) -> TimedResult {
         llama_synchronize(ctx);
         double t0 = now_ms();
         const int n_kept = llama_self_layer_prefill_partial(ctx, toks.data(), (int) toks.size(), &P);
         llama_synchronize(ctx);
         double t1 = now_ms();
-        return std::make_pair(n_kept, t1 - t0);
+        return {n_kept, t1 - t0, false};
     };
 
     if (args.mode == "once") {
         const int n_prompt = std::min(512, (int) cparams.n_batch - 1);
-        auto toks = make_prompt(vocab, n_prompt);
+        auto toks = make_realistic_prompt(vocab, n_prompt);
         llama_self_layer_prefill_params P;
         P.n_early_layers = n_early;
         P.keep_ratio = args.keep_ratio;
@@ -193,59 +239,69 @@ int main(int argc, char ** argv) {
         P.use_chunking = args.chunking;
         P.chunk_size = args.chunk_size;
 
-        float p_sf = 0, p_sd = 0;
-        auto pr = run_profiles(toks, P, &p_sf, &p_sd);
-        if (pr.first != 0) {
-            std::cerr << "attention_profiles failed: " << pr.first << "\n";
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-        std::cout << "{\"n_prompt\":" << n_prompt << ",\"n_layer\":" << n_layer
-                  << ",\"n_early\":" << n_early << ",\"profile_ms\":" << std::fixed << std::setprecision(2) << pr.second
-                  << ",\"pearson_shallow_vs_full\":" << p_sf << ",\"pearson_shallow_vs_deep\":" << p_sd << "}\n";
+        auto bl = run_baseline(toks);
+        auto part = run_partial(toks, P);
 
-        auto e2e = run_e2e(toks, P);
-        if (e2e.first < 0) {
-            std::cerr << "self_layer_prefill failed\n";
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-        std::cout << "{\"n_kept\":" << e2e.first << ",\"e2e_ms\":" << e2e.second << "}\n";
+        std::cout << "{\"n_prompt\":" << n_prompt
+                  << ",\"baseline_ms\":" << std::fixed << std::setprecision(2) << bl.elapsed_ms
+                  << ",\"partial_ms\":" << part.elapsed_ms
+                  << ",\"n_kept\":" << part.result
+                  << ",\"speedup\":" << std::setprecision(2) << (bl.elapsed_ms / part.elapsed_ms)
+                  << "}\n";
         llama_free(ctx);
         llama_model_free(model);
         return 0;
     }
 
-    // bench: grid over context lengths and keep_ratio (prompt must fit in one ubatch graph for Q/K extract)
+    // bench mode: grid over context lengths and keep_ratio
     const int n_ub = (int) llama_n_ubatch(ctx);
-    std::vector<int> ctx_lens = {512};
-    if (n_ub >= 2048) {
-        ctx_lens.push_back(2048);
-    }
-    if (n_ub >= 4096) {
-        ctx_lens.push_back(4096);
-    }
-    if (n_ub >= 8192) {
-        ctx_lens.push_back(8192);
-    }
+    std::vector<int> ctx_lens;
+    // Build ladder: 512, 1k, 2k, 4k, 8k, 16k, 32k
+    if (n_ub >= 512)   ctx_lens.push_back(512);
+    if (n_ub >= 1024)  ctx_lens.push_back(1024);
+    if (n_ub >= 2048)  ctx_lens.push_back(2048);
+    if (n_ub >= 4096)  ctx_lens.push_back(4096);
+    if (n_ub >= 8192)  ctx_lens.push_back(8192);
+    if (n_ub >= 16384) ctx_lens.push_back(16384);
+    if (n_ub >= 32768) ctx_lens.push_back(32768);
+
     const std::vector<float> keep_ratios = {0.10f, 0.25f, 0.50f, 1.00f};
 
+    // Count total benchmarks for progress
+    int total_benches = 0;
+    for (int L : ctx_lens) {
+        if (L < args.bench_min_prompt || L > (int) cparams.n_batch) continue;
+        total_benches += (int) keep_ratios.size();
+    }
+
+    log_progress(args.verbose, "\n[bench] Starting grid: %d context lengths x %d keep_ratios = %d points\n",
+                 (int) ctx_lens.size(), (int) keep_ratios.size(), total_benches);
+    log_progress(args.verbose, "[bench] warmup=%d, repeat=%d, timeout=%.0fs\n\n",
+                 args.n_warmup, args.n_repeat, args.timeout_sec);
+
+    // JSON output header
     std::cout << "{\n  \"model\": \"" << args.model_path << "\",\n";
-    std::cout << "  \"n_layer\": " << n_layer << ",\n  \"n_early_default\": " << n_early << ",\n";
-    std::cout << "  \"n_ctx\": " << cparams.n_ctx << ",\n  \"n_batch\": " << cparams.n_batch
-              << ",\n  \"n_gpu_layers\": " << mparams.n_gpu_layers << ",\n";
-    std::cout << "  \"runs\": " << args.n_repeat << ",\n  \"results\": [\n";
+    std::cout << "  \"n_layer\": " << n_layer << ",\n  \"n_early\": " << n_early << ",\n";
+    std::cout << "  \"n_ctx\": " << cparams.n_ctx << ",\n  \"n_batch\": " << cparams.n_batch << ",\n";
+    std::cout << "  \"n_gpu_layers\": " << mparams.n_gpu_layers << ",\n";
+    std::cout << "  \"multi_gpu\": " << (args.multi_gpu ? "true" : "false") << ",\n";
+    std::cout << "  \"runs\": " << args.n_repeat << ",\n";
+    std::cout << "  \"bench_min_prompt\": " << args.bench_min_prompt << ",\n  \"results\": [\n";
 
     bool first = true;
+    int bench_idx = 0;
+
     for (int L : ctx_lens) {
-        if (L > (int) cparams.n_batch) {
-            continue;
-        }
-        auto toks = make_prompt(vocab, L);
+        if (L < args.bench_min_prompt) continue;
+        if (L > (int) cparams.n_batch) continue;
+
+        log_progress(args.verbose, "=== n_prompt = %d ===\n", L);
+        auto toks = make_realistic_prompt(vocab, L);
 
         for (float kr : keep_ratios) {
+            bench_idx++;
+            log_progress(args.verbose, "  [%d/%d] n=%d, kr=%.2f: ", bench_idx, total_benches, L, kr);
+
             llama_self_layer_prefill_params P;
             P.n_early_layers = n_early;
             P.keep_ratio = kr;
@@ -253,65 +309,97 @@ int main(int argc, char ** argv) {
             P.use_chunking = args.chunking;
             P.chunk_size = args.chunk_size;
 
-            // warmup (include partial so first sched-reserve cost is paid here)
-            for (int w = 0; w < args.n_warmup; w++) {
-                float a = 0, b = 0;
-                run_profiles(toks, P, &a, &b);
-                run_baseline(toks);
-                run_e2e(toks, P);
-                run_kvprune(toks, P);
-                run_partial(toks, P);
+            // Warmup with timeout check
+            bool warmup_timeout = false;
+            for (int w = 0; w < args.n_warmup && !warmup_timeout; w++) {
+                log_progress(args.verbose, "W");
+                auto bl = run_baseline(toks);
+                if (bl.elapsed_ms > timeout_ms) {
+                    warmup_timeout = true;
+                    break;
+                }
+                auto part = run_partial(toks, P);
+                if (part.elapsed_ms > timeout_ms) {
+                    warmup_timeout = true;
+                    break;
+                }
             }
 
-            double sum_base = 0, sum_prof = 0, sum_e2e = 0, sum_kvp = 0, sum_part = 0;
-            float sum_psf = 0, sum_psd = 0;
+            if (warmup_timeout) {
+                log_progress(args.verbose, " TIMEOUT (warmup took >%.0fs), skipping\n", args.timeout_sec);
+                if (!first) std::cout << ",\n";
+                first = false;
+                std::cout << "    {\"n_prompt\":" << L << ",\"keep_ratio\":" << kr
+                          << ",\"error\":\"timeout\"}";
+                continue;
+            }
+
+            // Timed runs
+            double sum_base = 0, sum_part = 0;
             int ok = 0;
             int last_n_kept = 0;
-            int last_n_kept_kvp = 0;
-            int last_n_kept_part = 0;
-            for (int r = 0; r < args.n_repeat; r++) {
-                float p_sf = 0, p_sd = 0;
-                auto pr   = run_profiles(toks, P, &p_sf, &p_sd);
-                auto bl   = run_baseline(toks);
-                auto e2   = run_e2e(toks, P);
-                auto kvp  = run_kvprune(toks, P);
+            bool run_timeout = false;
+
+            for (int r = 0; r < args.n_repeat && !run_timeout; r++) {
+                log_progress(args.verbose, ".");
+
+                auto bl = run_baseline(toks);
+                if (bl.elapsed_ms > timeout_ms) {
+                    run_timeout = true;
+                    break;
+                }
+
                 auto part = run_partial(toks, P);
-                if (pr.first == 0 && bl.first == 0 && e2.first >= 0 && kvp.first >= 0 && part.first >= 0) {
-                    sum_prof += pr.second;
-                    sum_base += bl.second;
-                    sum_e2e  += e2.second;
-                    sum_kvp  += kvp.second;
-                    sum_part += part.second;
-                    sum_psf  += p_sf;
-                    sum_psd  += p_sd;
-                    last_n_kept = e2.first;
-                    last_n_kept_kvp = kvp.first;
-                    last_n_kept_part = part.first;
+                if (part.elapsed_ms > timeout_ms) {
+                    run_timeout = true;
+                    break;
+                }
+
+                if (bl.result == 0 && part.result >= 0) {
+                    sum_base += bl.elapsed_ms;
+                    sum_part += part.elapsed_ms;
+                    last_n_kept = part.result;
                     ok++;
                 }
             }
-            if (!first) {
-                std::cout << ",\n";
-            }
-            first = false;
-            if (ok <= 0) {
-                std::cout << "    {\"n_prompt\":" << L << ",\"keep_ratio\":" << kr << ",\"error\":\"failed\"}";
+
+            if (run_timeout) {
+                log_progress(args.verbose, " TIMEOUT (run took >%.0fs)\n", args.timeout_sec);
+                if (!first) std::cout << ",\n";
+                first = false;
+                std::cout << "    {\"n_prompt\":" << L << ",\"keep_ratio\":" << kr
+                          << ",\"error\":\"timeout\"}";
                 continue;
             }
-            std::cout << "    {\"n_prompt\":" << L << ",\"keep_ratio\":" << kr
-                      << ",\"baseline_prefill_ms_avg\":" << std::fixed << std::setprecision(2) << (sum_base / ok)
-                      << ",\"attention_profile_ms_avg\":" << (sum_prof / ok)
-                      << ",\"e2e_self_layer_ms_avg\":" << (sum_e2e / ok)
-                      << ",\"kv_prune_ms_avg\":" << (sum_kvp / ok)
-                      << ",\"partial_self_layer_ms_avg\":" << (sum_part / ok)
-                      << ",\"pearson_shallow_vs_full_avg\":" << std::setprecision(4) << (sum_psf / ok)
-                      << ",\"pearson_shallow_vs_deep_avg\":" << (sum_psd / ok)
-                      << ",\"n_kept_last_repeat\":" << last_n_kept
-                      << ",\"n_kept_kvprune_last_repeat\":" << last_n_kept_kvp
-                      << ",\"n_kept_partial_last_repeat\":" << last_n_kept_part << "}";
+
+            if (!first) std::cout << ",\n";
+            first = false;
+
+            if (ok <= 0) {
+                log_progress(args.verbose, " FAILED\n");
+                std::cout << "    {\"n_prompt\":" << L << ",\"keep_ratio\":" << kr
+                          << ",\"error\":\"failed\"}";
+                continue;
+            }
+
+            double base_avg = sum_base / ok;
+            double part_avg = sum_part / ok;
+            double speedup = base_avg / part_avg;
+
+            log_progress(args.verbose, " base=%.0fms, partial=%.0fms, speedup=%.2fx, kept=%d\n",
+                         base_avg, part_avg, speedup, last_n_kept);
+
+            std::cout << "    {\"n_prompt\":" << L << ",\"keep_ratio\":" << std::fixed << std::setprecision(2) << kr
+                      << ",\"baseline_ms\":" << base_avg
+                      << ",\"partial_ms\":" << part_avg
+                      << ",\"speedup\":" << speedup
+                      << ",\"n_kept\":" << last_n_kept << "}";
         }
     }
+
     std::cout << "\n  ]\n}\n";
+
+    log_progress(args.verbose, "\n[done] Benchmark complete.\n");
 
     llama_free(ctx);
     llama_model_free(model);

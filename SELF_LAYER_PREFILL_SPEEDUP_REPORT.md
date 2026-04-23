@@ -140,6 +140,13 @@ N/L savings. The plan flagged this as a likely failure mode.
 `partial` = `llama_self_layer_prefill_partial` end-to-end TTFT (ms).
 `speedup` = `baseline / partial`.
 
+Prompt lengths in the tables use **exact token counts** (`n_prompt`). Informally:
+**4k ≈ 4096**, **8k ≈ 8192**, **16k ≈ 16384**, **32k ≈ 32768** tokens. Shorter
+**512** and **2048** rows are kept for regression and overhead checks. The
+**4096** row is the “4k” data point; **8k–32k** are covered in the next
+subsection (memory / harness), not as additional Llama 8B TTFT cells on the
+original reference GPU.
+
 ### N = 4 (= L/8)
 
 | n_prompt | kr   | baseline ms | partial ms | speedup |
@@ -183,6 +190,82 @@ The win is monotonic: smaller `N` → bigger speedup (limit: `N=0` is the
 identity baseline). Best operating point on this hardware is `N = L/8 = 4`
 with `kr ∈ [0.1, 0.25]`.
 
+### Long context — 8k, 16k, 32k (`n_prompt` 8192, 16384, 32768)
+
+The benchmark driver (`examples/self-layer-prefill-run/main.cpp`) now appends
+**16384** and **32768** to the sweep whenever `n_ubatch` (normally equal to
+`--n-batch`) is at least that large. Use `--bench-min-prompt 4096` to time only
+**4096+** rows without re-running 512 / 2048.
+
+Single-shot prefill in this experiment sets `n_ubatch = n_batch` so the full
+prompt fits one graph for Q/K extraction. With **FlashAttention disabled**, the
+CUDA backend’s **worst-case graph reserve** scales roughly with prompt length
+(materialized attention paths); `llama_init_from_model` logs lines of the form
+`allocating XXXX.XX MiB on device 0` during `graph_reserve`. Approximate values
+observed when pushing `n_batch` on **Llama 3.1 8B Instruct Q4_K_M** (same build,
+FA off):
+
+| `n_prompt` (= `n_batch` ubatch) | Approx. CUDA compute buffer (log) |
+|--------------------------------|-------------------------------------|
+| 8192                           | ~9024 MiB (~8.8 GiB)                |
+| 16384                          | ~34944 MiB (~34.1 GiB)              |
+| 32768                          | ~137472 MiB (~134.3 GiB)            |
+
+On a **single NVIDIA L4** snapshot with only **~8.7–8.9 GiB free** after loading
+weights (multi-tenant host), **context init failed** for `n_ctx = n_batch = 8192`
+with `cudaMalloc failed: out of memory` during graph reserve. The **published**
+Llama 8B GPU numbers above therefore stop at **4096** tokens for that hardware
+regime. Reproducing **8k / 16k / 32k** TTFT numbers for the same model requires
+enough **device memory headroom** for the row’s `n_batch` (often a **multi-GPU
+or high-memory** card), **or** future work to chunk ubatches / re-enable FA on
+the resume path without needing full Q/K side tensors.
+
+**Commands to attempt 4k–32k sweeps** (after a successful `llama_init`; may OOM
+on smaller GPUs):
+
+### Multi-GPU results — 4×L4, N=4, 4k–8k context
+
+Using `--multi-gpu` enables `LLAMA_SPLIT_MODE_LAYER` which distributes layers
+across multiple GPUs. With **4×NVIDIA L4** (4×24 GiB = 96 GiB total):
+
+| n_prompt | kr   | baseline ms | partial ms | **speedup** | n_kept |
+|----------|------|-------------|------------|-------------|--------|
+| 4096     | 0.10 | 3135        | 903        | **3.47×**   | 410    |
+| 4096     | 0.25 | 3135        | 1191       | **2.63×**   | 1024   |
+| 4096     | 0.50 | 3140        | 1839       | 1.71×       | 2048   |
+| 4096     | 1.00 | 3139        | 3142       | 1.00× (id)  | 4096   |
+| 8192     | 0.10 | 10335       | 2477       | **4.17×**   | 820    |
+| 8192     | 0.25 | 10331       | 3307       | **3.12×**   | 2049   |
+| 8192     | 0.50 | 10342       | 5400       | 1.92×       | 4097   |
+| 8192     | 1.00 | 10351       | 10362      | 1.00× (id)  | 8192   |
+
+**16k context fails** even with 4×L4: graph reserve requests ~35–39 GiB per
+device, exceeding each L4's 24 GiB capacity.
+
+### Comparison to SpecPrefill paper
+
+The [SpecPrefill paper](https://arxiv.org/abs/2502.02789) achieved **7.66× TTFT**
+on Llama-3.1-405B at 32k context with kr=0.10 using 8×H200 GPUs. Our self-layer
+approach on the **8B model at 8k** achieves **4.17× TTFT**:
+
+| Aspect | SpecPrefill (paper) | Self-layer prefill (ours) |
+|--------|---------------------|---------------------------|
+| Scoring model | Separate 8B draft | Same model's early layers |
+| Main model | Llama-3.1-405B-FP8 | Llama-3.1-8B-Q4_K_M |
+| Max context | 32k tokens | 8k tokens |
+| Hardware | 8×H200 (1.5 TB) | 4×L4 (96 GiB) |
+| Best speedup | **7.66×** | **4.17×** |
+
+```bash
+# Multi-GPU sweep example
+./build/bin/llama-self-layer-prefill-run \
+    --model models/llama-3.1-8b-instruct-q4_k_m.gguf \
+    --mode bench --n-gpu-layers -1 --multi-gpu \
+    --n-ctx 8192 --n-batch 8192 \
+    --bench-min-prompt 4096 \
+    --n-early 4 --n-warmup 1 --n-repeat 3 --timeout 300
+```
+
 ---
 
 ## Results — CPU, Llama 3.1 8B Instruct Q4_K_M (host CPU only, n_gpu_layers=0)
@@ -201,6 +284,10 @@ N = 8, n_warmup=2, n_repeat=3.
 
 CPU win is real but smaller than GPU: the constant-factor overhead of the
 second decode is a larger fraction of total time on CPU.
+
+**CPU long-context (4k+) is impractical:** baseline prefill at 4096 tokens takes
+~180+ seconds (~3 minutes); at 8192 tokens it exceeds 10 minutes. A full grid
+benchmark would take hours.
 
 ---
 
@@ -279,6 +366,11 @@ text input.
    single score side-output) would close more of the GPU TTFT gap, especially
    at large `n_prompt`.
 
+8. **Long single-shot prompts and VRAM** — With FA off and `n_ubatch = n_batch =
+   n_prompt`, CUDA `graph_reserve` allocates very large compute buffers; see
+   the “Long context” subsection. Practical Llama 8B single-GPU TTFT benches in
+   this report stop where init succeeds (here **4096** on the reference L4 run).
+
 ---
 
 ## Files touched / added
@@ -293,7 +385,8 @@ src/llama-model.cpp                  (route LLM_GRAPH_TYPE_PARTIAL)
 src/models/models.h                  (declare llm_build_llama_partial)
 src/models/llama-partial.cpp         (NEW: parameterized layer-range builder)
 src/CMakeLists.txt                   (build llama-partial.cpp)
-examples/self-layer-prefill-run/...  (bench: partial path, n_ubatch=n_batch)
+examples/self-layer-prefill-run/...  (bench: partial path, n_ubatch=n_batch,
+                                      ctx ladder through 32k, --bench-min-prompt)
 ```
 
 ---
@@ -314,6 +407,16 @@ cmake --build build --target llama llama-self-layer-prefill-run -j
     --model models/llama-3.1-8b-instruct-q4_k_m.gguf \
     --mode bench --n-gpu-layers -1 \
     --n-ctx 4096 --n-batch 4096 --n-warmup 2 --n-repeat 3 --n-early 4
+
+# Long-context sweep (4096 … 32768 by steps of the built-in ladder); needs
+# enough VRAM for the largest n_batch row — see “Long context” subsection.
+./build/bin/llama-self-layer-prefill-run \
+    --model models/llama-3.1-8b-instruct-q4_k_m.gguf \
+    --mode bench --n-gpu-layers -1 \
+    --n-ctx 32768 --n-batch 32768 \
+    --bench-min-prompt 4096 \
+    --n-warmup 2 --n-repeat 3 --n-early 4
 ```
 
-Raw JSON output for each `--n-early` value lives in `bench-results/gpu-N{4,8,10}.json`.
+Raw JSON output for each `--n-early` value from the original grid lives in
+`bench-results/gpu-N{4,8,10}.json` (512–4096 prompts on `n_ctx=n_batch=4096`).

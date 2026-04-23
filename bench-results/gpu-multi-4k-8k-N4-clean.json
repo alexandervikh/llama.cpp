@@ -1,0 +1,20 @@
+{
+  "model": "models/llama-3.1-8b-instruct-q4_k_m.gguf",
+  "n_layer": 32,
+  "n_early": 4,
+  "n_ctx": 8192,
+  "n_batch": 8192,
+  "n_gpu_layers": -1,
+  "multi_gpu": true,
+  "runs": 3,
+  "bench_min_prompt": 4096,
+  "results": [
+    {"n_prompt":4096,"keep_ratio":0.10,"baseline_ms":3134.98,"partial_ms":902.58,"speedup":3.47,"n_kept":410},
+    {"n_prompt":4096,"keep_ratio":0.25,"baseline_ms":3134.77,"partial_ms":1190.66,"speedup":2.63,"n_kept":1024},
+    {"n_prompt":4096,"keep_ratio":0.50,"baseline_ms":3140.02,"partial_ms":1838.62,"speedup":1.71,"n_kept":2048},
+    {"n_prompt":4096,"keep_ratio":1.00,"baseline_ms":3139.23,"partial_ms":3142.27,"speedup":1.00,"n_kept":4096},
+    {"n_prompt":8192,"keep_ratio":0.10,"baseline_ms":10334.82,"partial_ms":2477.36,"speedup":4.17,"n_kept":820},
+    {"n_prompt":8192,"keep_ratio":0.25,"baseline_ms":10331.35,"partial_ms":3306.69,"speedup":3.12,"n_kept":2049},
+    {"n_prompt":8192,"keep_ratio":0.50,"baseline_ms":10341.71,"partial_ms":5400.00,"speedup":1.92,"n_kept":4097},
+    {"n_prompt":8192,"keep_ratio":1.00,"baseline_ms":10351.19,"partial_ms":10362.10,"speedup":1.00,"n_kept":8192}
+  ]
