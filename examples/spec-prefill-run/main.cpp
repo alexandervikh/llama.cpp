@@ -18,12 +18,15 @@ struct Args {
     int chunk_size = 32;
     std::string prompt_file;
     std::string out_file;
+    uint32_t n_ctx = 0;
+    uint32_t n_batch = 0;
 };
 
 static void print_usage() {
     std::cout << "Usage: llama-spec-prefill-run "
               << "--model <path> --spec-model <path> --prompt-file <path> --out <path> "
-              << "[--keep-ratio <ratio>] [--lookahead <n>] [--pool <n>] [--chunk-size <n>]\n";
+              << "[--keep-ratio <ratio>] [--lookahead <n>] [--pool <n>] [--chunk-size <n>] "
+              << "[--n-ctx <n>] [--n-batch <n>]\n";
 }
 
 static std::string greedy_decode(llama_context * ctx, const llama_vocab * vocab, int n_tokens_max) {
@@ -63,6 +66,8 @@ int main(int argc, char ** argv) {
         else if (arg == "--chunk-size" && i + 1 < argc) args.chunk_size = std::stoi(argv[++i]);
         else if (arg == "--prompt-file" && i + 1 < argc) args.prompt_file = argv[++i];
         else if (arg == "--out" && i + 1 < argc) args.out_file = argv[++i];
+        else if (arg == "--n-ctx" && i + 1 < argc) args.n_ctx = (uint32_t)std::stoul(argv[++i]);
+        else if (arg == "--n-batch" && i + 1 < argc) args.n_batch = (uint32_t)std::stoul(argv[++i]);
         else {
             print_usage();
             return 1;
@@ -83,9 +88,42 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    uint32_t prompt_n_tokens = 0;
+    {
+        std::ifstream peek(args.prompt_file);
+        std::string peek_line;
+        if (std::getline(peek, peek_line)) {
+            size_t kp = peek_line.find("\"prompt\":");
+            if (kp != std::string::npos) {
+                size_t sq = peek_line.find('"', kp + 9);
+                if (sq != std::string::npos) {
+                    size_t eq = sq + 1;
+                    while (eq < peek_line.size()) {
+                        if (peek_line[eq] == '\\') { eq += 2; continue; }
+                        if (peek_line[eq] == '"') break;
+                        eq++;
+                    }
+                    if (eq < peek_line.size()) {
+                        std::string peek_text = peek_line.substr(sq + 1, eq - sq - 1);
+                        {
+                            size_t p = peek_text.find("\\n");
+                            while (p != std::string::npos) {
+                                peek_text.replace(p, 2, "\n");
+                                p = peek_text.find("\\n", p + 1);
+                            }
+                        }
+                        const llama_vocab * vocab = llama_model_get_vocab(model_base);
+                        int n = -llama_tokenize(vocab, peek_text.c_str(), peek_text.size(), nullptr, 0, true, true);
+                        if (n > 0) prompt_n_tokens = (uint32_t)n;
+                    }
+                }
+            }
+        }
+    }
+
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 8192;
-    ctx_params.n_batch = 2048;
+    ctx_params.n_ctx = args.n_ctx ? args.n_ctx : std::max((uint32_t)8192, prompt_n_tokens + 256);
+    ctx_params.n_batch = args.n_batch ? args.n_batch : std::max((uint32_t)512, prompt_n_tokens + 128);
     llama_context * ctx_base = llama_init_from_model(model_base, ctx_params);
     llama_context * ctx_spec = llama_init_from_model(model_spec, ctx_params);
 
@@ -130,8 +168,13 @@ int main(int argc, char ** argv) {
         if (end >= line.size()) continue;
         std::string prompt_str = line.substr(start, end - start);
         // Unescape \n
-        for (size_t p = 0; (p = prompt_str.find("\\n", p)) != std::string::npos; p++)
-            prompt_str.replace(p, 2, "\n");
+        {
+            size_t p = prompt_str.find("\\n");
+            while (p != std::string::npos) {
+                prompt_str.replace(p, 2, "\n");
+                p = prompt_str.find("\\n", p + 1);
+            }
+        }
 
         // Tokenize
         int n_prompt = -llama_tokenize(vocab, prompt_str.c_str(), prompt_str.size(), nullptr, 0, true, true);

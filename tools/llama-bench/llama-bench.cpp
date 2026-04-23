@@ -22,6 +22,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-spec-prefill.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -312,6 +313,7 @@ static std::vector<int> parse_int_range(const std::string & s) {
 
 struct cmd_params {
     std::vector<std::string>         model;
+    std::vector<std::string>         spec_model;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
     std::vector<std::pair<int, int>> n_pg;
@@ -347,10 +349,16 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+
+    std::vector<float>               spec_keep_ratio;
+    std::vector<int>                 spec_n_lookahead;
+    std::vector<int>                 spec_pool;
+    std::vector<int>                 spec_chunk_size;
 };
 
 static const cmd_params cmd_params_defaults = {
     /* model                */ { "models/7B/ggml-model-q4_0.gguf" },
+    /* spec_model           */ { "" },
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -386,6 +394,10 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* spec_keep_ratio      */ { 0.25f },
+    /* spec_n_lookahead     */ { 8 },
+    /* spec_pool            */ { 13 },
+    /* spec_chunk_size      */ { 32 },
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -461,6 +473,17 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nopo, --no-op-offload <0|1>              (default: 0)\n");
     printf("  --no-host <0|1>                           (default: %s)\n",
            join(cmd_params_defaults.no_host, ",").c_str());
+    printf("\n");
+    printf("speculative prefill (optional, measured alongside baseline):\n");
+    printf("  -m2, --spec-model <filename>              speculative prefill model (default: none)\n");
+    printf("  --spec-kr <ratio>                         keep ratio (0.0-1.0, default: %.2f)\n",
+           cmd_params_defaults.spec_keep_ratio[0]);
+    printf("  --spec-lah <n>                            lookahead tokens (default: %d)\n",
+           cmd_params_defaults.spec_n_lookahead[0]);
+    printf("  --spec-pool <n>                           pooling kernel size (default: %d)\n",
+           cmd_params_defaults.spec_pool[0]);
+    printf("  --spec-chunk <n>                          chunk size (default: %d)\n",
+           cmd_params_defaults.spec_chunk_size[0]);
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -804,6 +827,41 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "-m2" || arg == "--spec-model") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.spec_model.insert(params.spec_model.end(), p.begin(), p.end());
+            } else if (arg == "--spec-kr") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<float>(argv[i], split_delim);
+                params.spec_keep_ratio.insert(params.spec_keep_ratio.end(), p.begin(), p.end());
+            } else if (arg == "--spec-lah") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.spec_n_lookahead.insert(params.spec_n_lookahead.end(), p.begin(), p.end());
+            } else if (arg == "--spec-pool") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.spec_pool.insert(params.spec_pool.end(), p.begin(), p.end());
+            } else if (arg == "--spec-chunk") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.spec_chunk_size.insert(params.spec_chunk_size.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1043,12 +1101,28 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.poll.empty()) {
         params.poll = cmd_params_defaults.poll;
     }
+    if (params.spec_model.empty()) {
+        params.spec_model = cmd_params_defaults.spec_model;
+    }
+    if (params.spec_keep_ratio.empty()) {
+        params.spec_keep_ratio = cmd_params_defaults.spec_keep_ratio;
+    }
+    if (params.spec_n_lookahead.empty()) {
+        params.spec_n_lookahead = cmd_params_defaults.spec_n_lookahead;
+    }
+    if (params.spec_pool.empty()) {
+        params.spec_pool = cmd_params_defaults.spec_pool;
+    }
+    if (params.spec_chunk_size.empty()) {
+        params.spec_chunk_size = cmd_params_defaults.spec_chunk_size;
+    }
 
     return params;
 }
 
 struct cmd_params_instance {
     std::string        model;
+    std::string        spec_model;
     int                n_prompt;
     int                n_gen;
     int                n_depth;
@@ -1074,6 +1148,10 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    float              spec_keep_ratio;
+    int                spec_n_lookahead;
+    int                spec_pool;
+    int                spec_chunk_size;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1184,13 +1262,19 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
-    for (const auto & pl : params.poll) {
+    for (const auto & pl : params.poll)
+    for (const auto & spec_m : params.spec_model)
+    for (const auto & kr : params.spec_keep_ratio)
+    for (const auto & spec_lah : params.spec_n_lookahead)
+    for (const auto & spec_pool : params.spec_pool)
+    for (const auto & spec_chunk : params.spec_chunk_size) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
             }
             cmd_params_instance instance = {
                 /* .model        = */ m,
+                /* .spec_model   = */ spec_m,
                 /* .n_prompt     = */ n_prompt,
                 /* .n_gen        = */ 0,
                 /* .n_depth      = */ nd,
@@ -1216,6 +1300,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .spec_keep_ratio    */ kr,
+                /* .spec_n_lookahead   */ spec_lah,
+                /* .spec_pool          */ spec_pool,
+                /* .spec_chunk_size    */ spec_chunk,
             };
             instances.push_back(instance);
         }
@@ -1226,6 +1314,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model        = */ m,
+                /* .spec_model   = */ spec_m,
                 /* .n_prompt     = */ 0,
                 /* .n_gen        = */ n_gen,
                 /* .n_depth      = */ nd,
@@ -1251,6 +1340,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .spec_keep_ratio    */ kr,
+                /* .spec_n_lookahead   */ spec_lah,
+                /* .spec_pool          */ spec_pool,
+                /* .spec_chunk_size    */ spec_chunk,
             };
             instances.push_back(instance);
         }
@@ -1261,6 +1354,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model        = */ m,
+                /* .spec_model   = */ spec_m,
                 /* .n_prompt     = */ n_pg.first,
                 /* .n_gen        = */ n_pg.second,
                 /* .n_depth      = */ nd,
@@ -1286,6 +1380,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .spec_keep_ratio    */ kr,
+                /* .spec_n_lookahead   */ spec_lah,
+                /* .spec_pool          */ spec_pool,
+                /* .spec_chunk_size    */ spec_chunk,
             };
             instances.push_back(instance);
         }
@@ -1326,11 +1424,16 @@ struct test {
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
+    std::string              spec_model;
+    float                    spec_keep_ratio;
+    int                      spec_n_lookahead;
+    int                      spec_n_kept;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
+    std::vector<uint64_t>    samples_ttft_ns;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1364,6 +1467,10 @@ struct test {
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
+        spec_model     = inst.spec_model;
+        spec_keep_ratio= inst.spec_keep_ratio;
+        spec_n_lookahead= inst.spec_n_lookahead;
+        spec_n_kept    = 0;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1421,8 +1528,9 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
-            "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            "no_op_offload",  "no_host",        "spec_model",    "spec_keep_ratio","spec_n_lookahead",
+            "n_prompt",       "n_gen",           "n_depth",       "test_time",      "avg_ns",
+            "stddev_ns",      "avg_ts",          "stddev_ts",      "spec_n_kept"
         };
         return fields;
     }
@@ -1433,11 +1541,15 @@ struct test {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
-            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe") {
+            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" || field == "spec_n_lookahead") {
+            return INT;
+        }
+        if (           field == "spec_n_kept") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
+            field == "spec_keep_ratio") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1514,6 +1626,9 @@ struct test {
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
+                                            spec_model.empty() ? "none" : spec_model,
+                                            std::to_string(spec_keep_ratio),
+                                            std::to_string(spec_n_lookahead),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
@@ -1521,7 +1636,8 @@ struct test {
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
-                                            std::to_string(stdev_ts()) };
+                                            std::to_string(stdev_ts()),
+                                            std::to_string(spec_n_kept) };
         return values;
     }
 
@@ -1630,7 +1746,8 @@ struct json_printer : public printer {
         fprintf(fout, "  {\n");
         print_fields(test::get_fields(), t.get_values());
         fprintf(fout, "    \"samples_ns\": [ %s ],\n", join(t.samples_ns, ", ").c_str());
-        fprintf(fout, "    \"samples_ts\": [ %s ]\n", join(t.get_ts(), ", ").c_str());
+        fprintf(fout, "    \"samples_ts\": [ %s ],\n", join(t.get_ts(), ", ").c_str());
+        fprintf(fout, "    \"samples_ttft_ns\": [ %s ]\n", join(t.samples_ttft_ns, ", ").c_str());
         fprintf(fout, "  }");
         fflush(fout);
     }
@@ -1650,7 +1767,8 @@ struct jsonl_printer : public printer {
         fprintf(fout, "{");
         print_fields(test::get_fields(), t.get_values());
         fprintf(fout, "\"samples_ns\": [ %s ],", join(t.samples_ns, ", ").c_str());
-        fprintf(fout, "\"samples_ts\": [ %s ]", join(t.get_ts(), ", ").c_str());
+        fprintf(fout, "\"samples_ts\": [ %s ],", join(t.get_ts(), ", ").c_str());
+        fprintf(fout, "\"samples_ttft_ns\": [ %s ]", join(t.samples_ttft_ns, ", ").c_str());
         fprintf(fout, "}\n");
         fflush(fout);
     }
@@ -2009,6 +2127,65 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     return true;
 }
 
+static bool spec_prefill_test_prompt(
+    llama_context * ctx_base,
+    llama_model * lmodel_spec,
+    llama_context * & ctx_spec,
+    int n_prompt,
+    int n_lookahead,
+    float keep_ratio,
+    int spec_pool,
+    int spec_chunk,
+    std::vector<uint64_t> & samples_ttft_ns,
+    int & spec_n_kept_out) {
+
+    const llama_model * model   = llama_get_model(ctx_base);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    // Generate random prompt tokens
+    std::vector<llama_token> prompt_tokens(n_prompt);
+    prompt_tokens[0] = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    for (int i = 1; i < n_prompt; i++) {
+        prompt_tokens[i] = std::rand() % n_vocab;
+    }
+
+    llama_spec_prefill_params spec_params;
+    spec_params.keep_ratio     = keep_ratio;
+    spec_params.n_lookahead    = n_lookahead;
+    spec_params.pool_kernel_size = spec_pool;
+    spec_params.use_chunking   = true;
+    spec_params.chunk_size     = spec_chunk;
+
+    llama_spec_prefill_context * spec_ctx = llama_spec_prefill_init_with_params(ctx_base, ctx_spec, spec_params);
+    if (spec_ctx == nullptr) {
+        fprintf(stderr, "%s: error: failed to init speculative prefill context\n", __func__);
+        return false;
+    }
+
+    bool ok = true;
+    for (int r = 0; r < 3; r++) {
+        llama_memory_clear(llama_get_memory(ctx_base), false);
+        uint64_t t_start = get_time_ns();
+        int n_kept = llama_spec_prefill(spec_ctx, prompt_tokens.data(), n_prompt, n_lookahead, keep_ratio);
+        uint64_t t_ns  = get_time_ns() - t_start;
+
+        if (n_kept < 0) {
+            fprintf(stderr, "%s: error: speculative prefill failed (n_kept=%d)\n", __func__, n_kept);
+            ok = false;
+            break;
+        }
+
+        samples_ttft_ns.push_back(t_ns);
+        if (r == 0) {
+            spec_n_kept_out = n_kept;
+        }
+    }
+
+    llama_spec_prefill_free(spec_ctx);
+    return ok;
+}
+
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) text;
@@ -2091,8 +2268,11 @@ int main(int argc, char ** argv) {
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
-    llama_model *               lmodel    = nullptr;
-    const cmd_params_instance * prev_inst = nullptr;
+    llama_model *               lmodel     = nullptr;
+    llama_model *               lmodel_spec = nullptr;
+    llama_context *             ctx_spec   = nullptr;
+    std::string                 lmodel_spec_file;
+    const cmd_params_instance * prev_inst  = nullptr;
 
     // store the llama_context state at the previous depth that we performed a test
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
@@ -2119,11 +2299,43 @@ int main(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
-        llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
+        if (!inst.spec_model.empty() && (lmodel_spec == nullptr || lmodel_spec_file != inst.spec_model)) {
+            if (lmodel_spec) {
+                llama_model_free(lmodel_spec);
+                lmodel_spec = nullptr;
+            }
+            if (ctx_spec) {
+                llama_free(ctx_spec);
+                ctx_spec = nullptr;
+            }
+            lmodel_spec_file = inst.spec_model;
+            lmodel_spec = llama_model_load_from_file(inst.spec_model.c_str(), inst.to_llama_mparams());
+            if (lmodel_spec == NULL) {
+                fprintf(stderr, "%s: error: failed to load spec model '%s'\n", __func__, inst.spec_model.c_str());
+                return 1;
+            }
+        }
+
+         llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_model_free(lmodel);
             return 1;
+        }
+
+       if (!inst.spec_model.empty() && ctx_spec == nullptr) {
+            {
+                llama_context_params sp_cparams = inst.to_llama_cparams();
+                sp_cparams.n_ctx += inst.spec_n_lookahead + 64;
+                sp_cparams.n_batch = (uint32_t)std::max((int)sp_cparams.n_batch, inst.n_prompt + inst.spec_n_lookahead);
+                ctx_spec = llama_init_from_model(lmodel_spec, sp_cparams);
+            }
+            if (ctx_spec == NULL) {
+                fprintf(stderr, "%s: error: failed to create spec context\n", __func__);
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
         }
 
         test t(inst, lmodel, ctx);
@@ -2227,12 +2439,12 @@ int main(int argc, char ** argv) {
 
             uint64_t t_start = get_time_ns();
 
-            if (t.n_prompt > 0) {
+            if (t.n_prompt > 0 && t.spec_model.empty()) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
@@ -2240,7 +2452,7 @@ int main(int argc, char ** argv) {
                     exit(1);
                 }
             }
-            if (t.n_gen > 0) {
+            if (t.n_gen > 0 && t.spec_model.empty()) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
@@ -2251,6 +2463,46 @@ int main(int argc, char ** argv) {
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     exit(1);
+                }
+            } else if (!t.spec_model.empty()) {
+                // Spec-prefill runs only when n_gen==0 (pp-only test).
+                // It needs a fresh context since it internally decodes the filtered tokens.
+                // Extra context for lookahead generation.
+                llama_context_params sp_cparams = inst.to_llama_cparams();
+                sp_cparams.n_ctx += inst.spec_n_lookahead + 64;
+                sp_cparams.n_batch = (uint32_t)std::max((int)sp_cparams.n_batch, inst.n_prompt + inst.spec_n_lookahead);
+                llama_free(ctx);
+                ctx = llama_init_from_model(lmodel, sp_cparams);
+                if (ctx == NULL) {
+                    fprintf(stderr, "%s: error: failed to create context for spec-prefill\n", __func__);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                llama_free(ctx_spec);
+                ctx_spec = llama_init_from_model(lmodel_spec, sp_cparams);
+                if (ctx_spec == NULL) {
+                    fprintf(stderr, "%s: error: failed to recreate spec context\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                if (params.progress) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: spec-prefill run %d/%d\n", params_idx, params_count,
+                            i + 1, params.reps);
+                }
+                int spec_n_kept = 0;
+                bool spec_ok = spec_prefill_test_prompt(
+                    ctx, lmodel_spec, ctx_spec,
+                    t.n_prompt, t.spec_n_lookahead, t.spec_keep_ratio,
+                    inst.spec_pool, inst.spec_chunk_size, t.samples_ttft_ns, spec_n_kept);
+                if (!spec_ok) {
+                    fprintf(stderr, "%s: error: failed to run spec-prefill\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                if (i == 0) {
+                    t.spec_n_kept = spec_n_kept;
                 }
             }
 

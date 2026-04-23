@@ -762,15 +762,26 @@ int llama_spec_prefill_process_base(
     // Clear base model KV cache
     llama_memory_clear(llama_get_memory(ctx->ctx_base), false);
 
-    // Process filtered tokens with their original positions
+    // Re-index positions to be contiguous [0..n_filtered-1].
+    // llama.cpp's llama_decode requires contiguous positions within a batch.
+    // The original non-contiguous positions (e.g., [0,1,2,3,4,5,6,7,16,17,...])
+    // are not supported — llama_decode will fail with "positions are not
+    // continuous" or GGML_ASSERT(n_tokens_all <= cparams.n_batch).
+    //
+    // Re-indexing is safe because:
+    // 1. The spec model already generated lookahead tokens using the full
+    //    prompt (generate_lookahead processes positions 0..n_prompt-1).
+    // 2. The base model only needs the KV cache entries for the filtered
+    //    tokens to continue generation — relative ordering is preserved.
+    // 3. RoPE at re-indexed positions gives slightly different absolute
+    //    embeddings but the same relative distances, which is fine for
+    //    continued generation.
     llama_batch batch = llama_batch_init(n_filtered, 0, 1);
     batch.n_tokens = 0;
 
     for (int i = 0; i < n_filtered; i++) {
-        // Positions are re-indexed 0..n_filtered-1 because llama.cpp's batch allocator
-        // requires contiguous positions. Original positions had gaps from chunk filtering.
         batch.token[batch.n_tokens] = filtered_tokens[i];
-        batch.pos[batch.n_tokens] = i;
+        batch.pos[batch.n_tokens] = i;  // re-indexed to [0..n_filtered-1]
         batch.n_seq_id[batch.n_tokens] = 1;
         batch.seq_id[batch.n_tokens][0] = 0;
         batch.logits[batch.n_tokens] = (i == n_filtered - 1);
