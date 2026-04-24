@@ -103,7 +103,10 @@ static std::set<int> get_kept_positions(
     const llama_token* tokens,
     int n_tokens,
     int n_early,
-    float keep_ratio
+    float keep_ratio,
+    bool use_max_aggregation = false,
+    int n_query_positions = 1,
+    int n_lookahead = 0
 ) {
     std::set<int> kept;
     
@@ -113,6 +116,10 @@ static std::set<int> get_kept_positions(
     params.keep_ratio = keep_ratio;
     params.pool_kernel_size = 1;
     params.use_chunking = false;
+    params.use_max_aggregation = use_max_aggregation;
+    params.n_query_positions = n_query_positions;
+    params.n_lookahead_tokens = n_lookahead;
+    params.lookahead_temp = 0.f;  // greedy
     
     int n_kept = llama_self_layer_prefill_partial(ctx, tokens, n_tokens, &params);
     
@@ -242,12 +249,59 @@ static std::vector<std::pair<std::string, std::string>> load_longbench(const std
     return prompts;
 }
 
+// Generate a long synthetic prompt for context length testing
+static std::string generate_long_prompt(int target_chars) {
+    std::string result;
+    result.reserve(target_chars + 1000);
+    
+    // Create a document-like structure with varying content
+    std::vector<std::string> topics = {
+        "The history of computing began with mechanical calculators in the 17th century. "
+        "Charles Babbage designed the Analytical Engine, which contained an ALU, basic flow control, "
+        "and integrated memory. Ada Lovelace wrote what is considered the first algorithm.",
+        
+        "Machine learning emerged from pattern recognition and computational learning theory. "
+        "Arthur Samuel coined the term in 1959 while at IBM. Early systems focused on checkers and "
+        "simple games before expanding to image recognition and natural language processing.",
+        
+        "The transformer architecture was introduced in 2017 with the paper 'Attention Is All You Need'. "
+        "It revolutionized natural language processing by replacing recurrence with self-attention. "
+        "Models like GPT and BERT built upon this foundation to achieve remarkable capabilities.",
+        
+        "Quantum computing leverages quantum mechanical phenomena like superposition and entanglement. "
+        "Unlike classical bits, qubits can exist in multiple states simultaneously. This enables "
+        "potential speedups for certain classes of problems like factoring and optimization.",
+        
+        "Neural networks are inspired by biological neurons in the brain. "
+        "Deep learning stacks multiple layers to learn hierarchical representations. "
+        "Convolutional layers excel at image processing while recurrent layers handle sequences.",
+    };
+    
+    int para_idx = 0;
+    while ((int)result.size() < target_chars) {
+        result += "## Section " + std::to_string(para_idx + 1) + "\n\n";
+        for (int i = 0; i < 3 && (int)result.size() < target_chars; i++) {
+            result += topics[(para_idx + i) % topics.size()] + "\n\n";
+        }
+        para_idx++;
+    }
+    
+    result += "\nQuestion: Based on the above text, what were the key developments?\nAnswer:";
+    return result;
+}
+
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string longbench_path = "datasets/longbench/subset/qasper.json";
     int n_ctx = 2048;
     int n_gpu_layers = -1;
     bool multi_gpu = false;
+    std::vector<float> keep_ratios = {0.1f, 0.25f};
+    int n_early_min = 2;
+    int n_early_max = -1;  // -1 = use n_layer
+    bool use_max_agg = false;  // false = sum-mean (original), true = max-max (SpecPrefill)
+    int n_query_pos = 1;  // number of query positions (1 = last only, 8 = SpecPrefill style)
+    int n_lookahead = 0;  // if > 0, use early exit to generate look-ahead tokens
     
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -261,11 +315,31 @@ int main(int argc, char ** argv) {
             n_gpu_layers = std::stoi(argv[++i]);
         } else if (arg == "--multi-gpu") {
             multi_gpu = true;
+        } else if (arg == "--keep-ratios" && i + 1 < argc) {
+            keep_ratios.clear();
+            std::string kr_str = argv[++i];
+            std::stringstream ss(kr_str);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                keep_ratios.push_back(std::stof(item));
+            }
+        } else if (arg == "--n-early-min" && i + 1 < argc) {
+            n_early_min = std::stoi(argv[++i]);
+        } else if (arg == "--n-early-max" && i + 1 < argc) {
+            n_early_max = std::stoi(argv[++i]);
+        } else if (arg == "--use-max") {
+            use_max_agg = true;
+        } else if (arg == "--n-query" && i + 1 < argc) {
+            n_query_pos = std::stoi(argv[++i]);
+        } else if (arg == "--n-lookahead" && i + 1 < argc) {
+            n_lookahead = std::stoi(argv[++i]);
         }
     }
     
     if (model_path.empty()) {
         std::cerr << "Usage: token_overlap --model <gguf> [--n-ctx N] [--n-gpu-layers N] [--multi-gpu]\n";
+        std::cerr << "       [--keep-ratios 0.1,0.25] [--n-early-min N] [--n-early-max N] [--use-max]\n";
+        std::cerr << "       [--n-query N] [--n-lookahead N]\n";
         return 1;
     }
     
@@ -286,7 +360,9 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_layer = (int)llama_model_n_layer(model);
     
-    log_info("Model: %d layers\n", n_layer);
+    if (n_early_max < 0) n_early_max = n_layer;
+    
+    log_info("Model: %d layers, n_early_min=%d, n_early_max=%d\n", n_layer, n_early_min, n_early_max);
     
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
@@ -301,22 +377,41 @@ int main(int argc, char ** argv) {
         return 1;
     }
     
-    // Collect prompts
-    auto prompts = get_prompts();
-    auto lb_prompts = load_longbench(longbench_path, 1200);
+    // Collect prompts - for large contexts, generate synthetic long prompts
+    std::vector<std::pair<std::string, std::string>> prompts;
+    
+    if (n_ctx >= 4096) {
+        // Generate prompts that fill the context
+        int target_sizes[] = {2048, 4096, 8192};
+        for (int target : target_sizes) {
+            if (target <= n_ctx) {
+                // Target chars ~ 4x target tokens (rough estimate)
+                std::string long_prompt = generate_long_prompt(target * 3);
+                prompts.push_back({"Synth-" + std::to_string(target/1024) + "k", long_prompt});
+            }
+        }
+    }
+    
+    // Also add short prompts
+    auto short_prompts = get_prompts();
+    prompts.insert(prompts.end(), short_prompts.begin(), short_prompts.end());
+    
+    // Add LongBench prompts with larger context
+    auto lb_prompts = load_longbench(longbench_path, n_ctx * 3);
     prompts.insert(prompts.end(), lb_prompts.begin(), lb_prompts.end());
     
-    log_info("Testing %zu prompts\n\n", prompts.size());
-    
-    // Compare n_early = min (e.g., 2) vs n_early = max (all layers)
-    int n_early_min = 2;
-    int n_early_max = n_layer;
-    
-    std::vector<float> keep_ratios = {0.3f, 0.5f, 0.7f};
+    log_info("Testing %zu prompts with n_ctx=%d\n\n", prompts.size(), n_ctx);
     
     printf("=== Token Set Overlap Analysis ===\n");
-    printf("Comparing which SPECIFIC tokens are selected at n_early=%d vs n_early=%d\n\n", 
+    printf("Comparing which SPECIFIC tokens are selected at n_early=%d vs n_early=%d\n", 
            n_early_min, n_early_max);
+    if (n_lookahead > 0) {
+        printf("Mode: EARLY EXIT LOOK-AHEAD (n_lookahead=%d) - SpecPrefill style\n\n", n_lookahead);
+    } else {
+        printf("Aggregation: %s, Query positions: %d\n\n", 
+               use_max_agg || n_query_pos > 1 ? "MAX-MAX-MEAN (SpecPrefill style)" : "SUM-MEAN (original)",
+               n_query_pos);
+    }
     
     for (float kr : keep_ratios) {
         printf("--- keep_ratio = %.1f ---\n", kr);
@@ -333,8 +428,8 @@ int main(int argc, char ** argv) {
             if ((int)tokens.size() > n_ctx - 10) tokens.resize(n_ctx - 10);
             if (tokens.size() < 30) continue;
             
-            auto kept_min = get_kept_positions(ctx, tokens.data(), (int)tokens.size(), n_early_min, kr);
-            auto kept_max = get_kept_positions(ctx, tokens.data(), (int)tokens.size(), n_early_max, kr);
+            auto kept_min = get_kept_positions(ctx, tokens.data(), (int)tokens.size(), n_early_min, kr, use_max_agg, n_query_pos, n_lookahead);
+            auto kept_max = get_kept_positions(ctx, tokens.data(), (int)tokens.size(), n_early_max, kr, use_max_agg, n_query_pos, n_lookahead);
             
             if (kept_min.empty() || kept_max.empty()) {
                 printf("%-15s %6d %6s %6s %8s %8s\n",

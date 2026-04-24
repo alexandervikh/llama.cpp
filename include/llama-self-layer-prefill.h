@@ -21,6 +21,10 @@ struct llama_self_layer_prefill_params {
     int   pool_kernel_size = 13;   // 1 = disabled
     bool  use_chunking     = false;
     int   chunk_size       = 32;
+    bool  use_max_aggregation = false;  // true = max-max (SpecPrefill), false = sum-mean (original)
+    int   n_query_positions = 1;        // number of query positions for scoring (1 = last only)
+    int   n_lookahead_tokens = 0;       // if > 0, generate look-ahead tokens via early exit (SpecPrefill style)
+    float lookahead_temp   = 0.f;       // temperature for look-ahead token generation (0 = greedy)
 
     llama_self_layer_prefill_params() = default;
 };

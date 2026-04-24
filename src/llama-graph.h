@@ -563,9 +563,12 @@ struct llm_graph_params {
     //   residual-stream input that feeds layer il_start.
     // - il_end < n_layer: skip output norm + lm_head; the residual stream after
     //   layer (il_end-1) is exposed as res->t_embd.
+    // - early_exit = true: apply output norm + lm_head even when il_end < n_layer
+    //   (for "early exit" inference using early layers as a draft model).
     // Defaults select the full model (legacy behaviour for non-PARTIAL graphs).
-    int32_t il_start = 0;
-    int32_t il_end   = -1;     // -1 means n_layer
+    int32_t il_start    = 0;
+    int32_t il_end      = -1;     // -1 means n_layer
+    bool    early_exit  = false;  // Apply output head at early layer
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases

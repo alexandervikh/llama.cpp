@@ -140,9 +140,11 @@ struct llama_context {
     // - When il_end < n_layer, output norm + lm_head are skipped; the residual stream
     //   after layer (il_end-1) is exposed as t_embd and copied into ctx->embd buffer
     //   (one row per output token).
+    // - When early_exit is true, output_norm + lm_head are applied even when il_end < n_layer
+    //   (for look-ahead token generation using early layers as a "draft model").
     // Note: only LLM_ARCH_LLAMA / LLAMA4 (single-graph variant) is supported. Other
     // archs return -3.
-    int decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end);
+    int decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end, bool early_exit = false);
 
     // Initialize self-layer prefill with a fixed n_early value.
     // This pre-reserves a cached partial graph for layers [0, n_early) to avoid
@@ -157,6 +159,7 @@ struct llama_context {
 
     // Hidden-state slot for cross-call partial decode.
     int32_t partial_il_start_pending = 0;
+    bool    partial_early_exit       = false;  // Apply output_norm + lm_head at early exit
     int32_t partial_il_end_pending   = -1;
     llm_graph_type decode_gtype      = LLM_GRAPH_TYPE_DECODER;
 

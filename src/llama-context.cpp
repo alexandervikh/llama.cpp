@@ -1813,7 +1813,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     return 0;
 }
 
-int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end) {
+int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end, bool early_exit) {
     const int32_t n_layer_total = (int32_t) model.hparams.n_layer;
 
     if (il_end < 0) il_end = n_layer_total;
@@ -1835,10 +1835,12 @@ int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_star
         return -1;
     }
 
-    const bool last_chunk = (il_end == n_layer_total);
+    // When early_exit is true, we pretend this is the last chunk so output_norm + lm_head are applied
+    const bool last_chunk = (il_end == n_layer_total) || early_exit;
 
     partial_il_start_pending = il_start;
     partial_il_end_pending   = il_end;
+    partial_early_exit       = early_exit;
     decode_gtype             = LLM_GRAPH_TYPE_PARTIAL;
 
     // Force embeddings extraction whenever the chunk does not end at the model output;
@@ -1854,6 +1856,7 @@ int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_star
     decode_gtype              = LLM_GRAPH_TYPE_DECODER;
     partial_il_start_pending  = 0;
     partial_il_end_pending    = -1;
+    partial_early_exit        = false;
     return r;
 }
 
@@ -2180,8 +2183,9 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
     };
     if (gtype == LLM_GRAPH_TYPE_PARTIAL) {
-        p.il_start = partial_il_start_pending;
-        p.il_end   = partial_il_end_pending;
+        p.il_start   = partial_il_start_pending;
+        p.il_end     = partial_il_end_pending;
+        p.early_exit = partial_early_exit;
     }
     return p;
 }

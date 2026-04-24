@@ -15,6 +15,92 @@
 #include <cstring>
 #include <vector>
 
+// ============================================================================
+// Look-ahead Token Generation for SpecPrefill-style scoring
+// Uses early exit mechanism: runs only n_early_layers but applies output_norm
+// and lm_head to get logits for speculative token generation.
+// ============================================================================
+
+// Generate look-ahead tokens using early exit (layers 0..n_early_layers with lm_head)
+// Returns the generated tokens in `out_tokens`
+static int generate_lookahead_tokens(
+    llama_context * ctx,
+    const llama_token * prompt_tokens,
+    int n_prompt,
+    int n_early_layers,        // number of early layers to use (e.g., 4)
+    int n_lookahead,           // number of tokens to generate (e.g., 8)
+    std::vector<llama_token> & out_tokens,
+    float temperature = 0.f    // 0 = greedy (unused for now, always greedy)
+) {
+    GGML_UNUSED(temperature);
+    
+    const llama_model * model = llama_get_model(ctx);
+    if (!model) return -1;
+    
+    const int n_vocab = (int)llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int n_layer_total = (int)llama_model_n_layer(model);
+    
+    // Validate n_early_layers
+    if (n_early_layers <= 0 || n_early_layers > n_layer_total) {
+        fprintf(stderr, "[lookahead] invalid n_early_layers=%d, n_layer=%d\n", 
+                n_early_layers, n_layer_total);
+        return -1;
+    }
+    
+    out_tokens.clear();
+    out_tokens.reserve((size_t)n_lookahead);
+    
+    // Clear KV cache
+    llama_memory_clear(llama_get_memory(ctx), false);
+    
+    // Decode prompt using early exit (layers 0..n_early_layers with lm_head)
+    llama_batch batch = llama_batch_get_one((llama_token *)prompt_tokens, n_prompt);
+    
+    // Use decode_partial with early_exit=true to get logits from early layers
+    int r = ctx->decode_partial(batch, 0, n_early_layers, /*early_exit=*/true);
+    
+    if (r != 0) {
+        fprintf(stderr, "[lookahead] initial decode_partial failed: %d\n", r);
+        return -1;
+    }
+    
+    // Generate look-ahead tokens one by one
+    for (int gen = 0; gen < n_lookahead; gen++) {
+        // Get logits for the last token (use -1 for last position)
+        float * logits = llama_get_logits_ith(ctx, -1);
+        if (!logits) {
+            fprintf(stderr, "[lookahead] failed to get logits at gen=%d\n", gen);
+            return -1;
+        }
+        
+        // Greedy sampling: find argmax
+        llama_token next_token = 0;
+        float max_logit = logits[0];
+        for (int v = 1; v < n_vocab; v++) {
+            if (logits[v] > max_logit) {
+                max_logit = logits[v];
+                next_token = v;
+            }
+        }
+        
+        out_tokens.push_back(next_token);
+        
+        // Decode next token using early exit (if not last iteration)
+        if (gen < n_lookahead - 1) {
+            llama_batch single = llama_batch_get_one(&next_token, 1);
+            
+            r = ctx->decode_partial(single, 0, n_early_layers, /*early_exit=*/true);
+            
+            if (r != 0) {
+                fprintf(stderr, "[lookahead] decode_partial token %d failed: %d\n", gen, r);
+                return -1;
+            }
+        }
+    }
+    
+    return 0;
+}
+
 // Graph tensor names are "Qcur-0", "Kcur-0"; with multi-backend copies they look like
 // "CUDA0#Qcur-5#1" — match the stable infix, not the first character.
 // Skip fused/view variants: "(reshaped)", "(view)", "(permuted)" have wrong layouts.
@@ -159,11 +245,11 @@ static inline float k_at(const std::vector<float> & k, int64_t d, int64_t kh, in
     return k[(size_t)(d + ne0 * (kh + ne1 * t))];
 }
 
-// Phase 1 cheap scoring: per token j, sum over heads h of Q[last,h,:] . K[j,kh,:]
-// (raw scaled dot, no softmax). GQA reduces cost by pre-summing Q within each KV group:
-//   imp[j] = sum_kh K[j,kh,:] . ( sum_{h in group(kh)} Q[last,h,:] ) * scale
-// Cost ~= n_kv * n_tok * d  vs. old n_head * n_tok * d + n_head * 2*n_tok softmax.
-static void layer_last_query_importance(const slp_layer_qk & L, int qi_last, std::vector<float> & imp) {
+// Phase 1 cheap scoring: per token j, compute importance from query position(s) to key position j.
+// Two modes:
+// - use_max_heads=false (original): SUM over heads
+// - use_max_heads=true (SpecPrefill): MAX over heads
+static void layer_query_importance(const slp_layer_qk & L, int qi, std::vector<float> & imp, bool use_max_heads = false) {
     const int64_t n_tok = L.n_tok;
     const int n_head = (int) L.n_head;
     const int n_kv = (int) L.n_kv;
@@ -171,33 +257,58 @@ static void layer_last_query_importance(const slp_layer_qk & L, int qi_last, std
     const int group = n_head / n_kv;
     const float scale = 1.f / sqrtf(float(d));
 
-    std::vector<float> q_sum((size_t)(d * n_kv), 0.f);
-    for (int kh = 0; kh < n_kv; kh++) {
-        for (int hg = 0; hg < group; hg++) {
-            const int h = kh * group + hg;
-            for (int di = 0; di < d; di++) {
-                q_sum[(size_t)(di + d * kh)] +=
-                    q_at(L.q, di, h, qi_last, L.d, L.n_head);
+    if (use_max_heads) {
+        // MAX over heads (SpecPrefill style): pick the most salient head per token
+        imp.assign((size_t) n_tok, -1e30f);
+        for (int j = 0; j < (int) n_tok; j++) {
+            for (int h = 0; h < n_head; h++) {
+                const int kh = h / group;
+                float t = 0;
+                for (int di = 0; di < d; di++) {
+                    t += q_at(L.q, di, h, qi, L.d, L.n_head)
+                       * k_at(L.k, di, kh, j, L.d, L.n_kv);
+                }
+                t *= scale;
+                if (t > imp[(size_t) j]) {
+                    imp[(size_t) j] = t;
+                }
             }
         }
-    }
-
-    imp.assign((size_t) n_tok, 0.f);
-    for (int j = 0; j < (int) n_tok; j++) {
-        float s = 0;
+    } else {
+        // SUM over heads (original): average contribution across all heads
+        std::vector<float> q_sum((size_t)(d * n_kv), 0.f);
         for (int kh = 0; kh < n_kv; kh++) {
-            float t = 0;
-            for (int di = 0; di < d; di++) {
-                t += q_sum[(size_t)(di + d * kh)]
-                   * k_at(L.k, di, kh, j, L.d, L.n_kv);
+            for (int hg = 0; hg < group; hg++) {
+                const int h = kh * group + hg;
+                for (int di = 0; di < d; di++) {
+                    q_sum[(size_t)(di + d * kh)] +=
+                        q_at(L.q, di, h, qi, L.d, L.n_head);
+                }
             }
-            s += t;
         }
-        imp[(size_t) j] = s * scale;
+
+        imp.assign((size_t) n_tok, 0.f);
+        for (int j = 0; j < (int) n_tok; j++) {
+            float s = 0;
+            for (int kh = 0; kh < n_kv; kh++) {
+                float t = 0;
+                for (int di = 0; di < d; di++) {
+                    t += q_sum[(size_t)(di + d * kh)]
+                       * k_at(L.k, di, kh, j, L.d, L.n_kv);
+                }
+                s += t;
+            }
+            imp[(size_t) j] = s * scale;
+        }
     }
 }
 
-static void accumulate_range(const std::vector<slp_layer_qk> & layers, int il0, int il1, int qi_last, std::vector<float> & out) {
+// Wrapper for backward compatibility - uses single query position (last token)
+static void layer_last_query_importance(const slp_layer_qk & L, int qi_last, std::vector<float> & imp, bool use_max_heads = false) {
+    layer_query_importance(L, qi_last, imp, use_max_heads);
+}
+
+static void accumulate_range(const std::vector<slp_layer_qk> & layers, int il0, int il1, int qi_last, std::vector<float> & out, bool use_max = false) {
     out.clear();
     int count = 0;
     for (const auto & L : layers) {
@@ -205,20 +316,81 @@ static void accumulate_range(const std::vector<slp_layer_qk> & layers, int il0, 
             continue;
         }
         std::vector<float> imp;
-        layer_last_query_importance(L, qi_last, imp);
+        layer_last_query_importance(L, qi_last, imp, use_max);
         if (out.empty()) {
             out = std::move(imp);
         } else {
             for (size_t i = 0; i < out.size(); i++) {
-                out[i] += imp[i];
+                if (use_max) {
+                    // MAX over layers (SpecPrefill style)
+                    if (imp[i] > out[i]) out[i] = imp[i];
+                } else {
+                    // SUM for later averaging (original)
+                    out[i] += imp[i];
+                }
             }
         }
         count++;
     }
-    if (count > 1) {
+    if (!use_max && count > 1) {
         for (float & v : out) {
             v /= float(count);
         }
+    }
+}
+
+// SpecPrefill-style aggregation with multiple query positions:
+// 1. MAX over heads (per layer, per query)
+// 2. MAX over layers (per query)
+// 3. MEAN over query positions
+static void accumulate_range_multi_query(
+    const std::vector<slp_layer_qk> & layers,
+    int il0, int il1,
+    const std::vector<int> & query_positions,  // multiple query positions
+    std::vector<float> & out
+) {
+    out.clear();
+    if (layers.empty() || query_positions.empty()) return;
+
+    const size_t n_tok = layers[0].n_tok;
+    
+    // For each query position, compute max-max (over heads, over layers)
+    std::vector<std::vector<float>> per_query_scores;
+    per_query_scores.reserve(query_positions.size());
+    
+    for (int qi : query_positions) {
+        if (qi < 0 || qi >= (int)n_tok) continue;
+        
+        std::vector<float> query_max(n_tok, -1e30f);  // max over layers for this query
+        
+        for (const auto & L : layers) {
+            if (L.layer < il0 || L.layer >= il1) continue;
+            
+            std::vector<float> layer_imp;
+            layer_query_importance(L, qi, layer_imp, true);  // MAX over heads
+            
+            // MAX over layers
+            for (size_t j = 0; j < n_tok && j < layer_imp.size(); j++) {
+                if (layer_imp[j] > query_max[j]) {
+                    query_max[j] = layer_imp[j];
+                }
+            }
+        }
+        per_query_scores.push_back(std::move(query_max));
+    }
+    
+    if (per_query_scores.empty()) return;
+    
+    // MEAN over query positions
+    out.assign(n_tok, 0.f);
+    for (const auto & qs : per_query_scores) {
+        for (size_t j = 0; j < n_tok && j < qs.size(); j++) {
+            out[j] += qs[j];
+        }
+    }
+    const float inv_n = 1.f / float(per_query_scores.size());
+    for (float & v : out) {
+        v *= inv_n;
     }
 }
 
@@ -311,9 +483,10 @@ int llama_self_layer_prefill_attention_profiles(
     }
 
     const int qi_last = n_prompt - 1;
-    accumulate_range(layers, 0, P.n_early_layers, qi_last, out_shallow);
-    accumulate_range(layers, P.n_early_layers, n_layer, qi_last, out_deep);
-    accumulate_range(layers, 0, n_layer, qi_last, out_full);
+    const bool use_max = P.use_max_aggregation;
+    accumulate_range(layers, 0, P.n_early_layers, qi_last, out_shallow, use_max);
+    accumulate_range(layers, P.n_early_layers, n_layer, qi_last, out_deep, use_max);
+    accumulate_range(layers, 0, n_layer, qi_last, out_full, use_max);
 
     if (out_shallow.empty() || out_deep.empty() || out_full.empty()) {
         return -1;
@@ -393,7 +566,7 @@ int llama_self_layer_prefill_with_kv_prune(
     if (P.n_early_layers > n_layer) P.n_early_layers = n_layer;
 
     std::vector<float> imp;
-    accumulate_range(layers, 0, P.n_early_layers, n_prompt - 1, imp);
+    accumulate_range(layers, 0, P.n_early_layers, n_prompt - 1, imp, P.use_max_aggregation);
     if (imp.empty()) {
         return -1;
     }
@@ -437,15 +610,119 @@ int llama_self_layer_prefill_with_kv_prune(
     return n_kept;
 }
 
+// SpecPrefill-style scoring with generated look-ahead tokens:
+// 1. Generate N look-ahead tokens using early exit (n_early layers + lm_head)
+// 2. Decode prompt + look-ahead tokens together
+// 3. Compute attention from each look-ahead token to all prompt positions
+// 4. Aggregate: MAX over heads, MAX over layers, MEAN over look-ahead tokens
+static int self_layer_score_with_lookahead(
+    llama_context * ctx,
+    const llama_token * prompt_tokens,
+    int n_prompt,
+    int n_early_layers,
+    int n_lookahead,           // number of look-ahead tokens to generate (e.g., 8)
+    std::vector<float> & out_imp,
+    float lookahead_temp = 0.f // 0 = greedy
+) {
+    if (!ctx || !prompt_tokens || n_prompt <= 0 || n_early_layers < 1 || n_lookahead < 1) {
+        return -1;
+    }
+    
+    // Step 1: Generate look-ahead tokens using early exit
+    std::vector<llama_token> lookahead_tokens;
+    int gen_r = generate_lookahead_tokens(ctx, prompt_tokens, n_prompt, n_early_layers, 
+                                           n_lookahead, lookahead_tokens, lookahead_temp);
+    if (gen_r != 0 || (int)lookahead_tokens.size() != n_lookahead) {
+        fprintf(stderr, "[specprefill] failed to generate look-ahead tokens: %d\n", gen_r);
+        return -1;
+    }
+    
+    // Step 2: Decode prompt + look-ahead tokens together using early layers
+    const int n_total = n_prompt + n_lookahead;
+    if (n_total > (int)llama_n_batch(ctx)) {
+        fprintf(stderr, "[specprefill] prompt + lookahead (%d) exceeds batch size\n", n_total);
+        return -2;
+    }
+    
+    llama_memory_clear(llama_get_memory(ctx), false);
+    
+    llama_batch batch = llama_batch_init(n_total, 0, 1);
+    batch.n_tokens = 0;
+    
+    // Add prompt tokens
+    for (int i = 0; i < n_prompt; i++) {
+        batch.token[batch.n_tokens] = prompt_tokens[i];
+        batch.pos[batch.n_tokens] = i;
+        batch.n_seq_id[batch.n_tokens] = 1;
+        batch.seq_id[batch.n_tokens][0] = 0;
+        batch.logits[batch.n_tokens] = false;
+        batch.n_tokens++;
+    }
+    
+    // Add look-ahead tokens (positioned after prompt)
+    for (int i = 0; i < n_lookahead; i++) {
+        batch.token[batch.n_tokens] = lookahead_tokens[(size_t)i];
+        batch.pos[batch.n_tokens] = n_prompt + i;
+        batch.n_seq_id[batch.n_tokens] = 1;
+        batch.seq_id[batch.n_tokens][0] = 0;
+        batch.logits[batch.n_tokens] = false;
+        batch.n_tokens++;
+    }
+    
+    const int r = ctx->decode_partial(batch, 0, n_early_layers);
+    llama_batch_free(batch);
+    
+    if (r != 0) {
+        fprintf(stderr, "[specprefill] decode failed: %d\n", r);
+        return -1;
+    }
+    
+    // Step 3: Extract Q/K from the decode and compute importance
+    std::vector<slp_layer_qk> layers;
+    if (extract_qk_all_layers(*ctx, layers) != 0) {
+        fprintf(stderr, "[specprefill] failed to extract Q/K tensors\n");
+        return -1;
+    }
+    
+    // Step 4: For each look-ahead token, compute attention to prompt tokens
+    // Then average (MEAN over look-ahead tokens)
+    // Query positions are: n_prompt, n_prompt+1, ..., n_prompt+n_lookahead-1
+    std::vector<int> query_positions;
+    for (int i = 0; i < n_lookahead; i++) {
+        query_positions.push_back(n_prompt + i);
+    }
+    
+    // Use max-max-mean aggregation
+    accumulate_range_multi_query(layers, 0, n_early_layers, query_positions, out_imp);
+    
+    // Only return importance for prompt tokens (first n_prompt)
+    if ((int)out_imp.size() > n_prompt) {
+        out_imp.resize((size_t)n_prompt);
+    }
+    
+    if ((int)out_imp.size() != n_prompt) {
+        fprintf(stderr, "[specprefill] importance size mismatch: %zu vs %d\n", out_imp.size(), n_prompt);
+        return -1;
+    }
+    
+    return 0;
+}
+
 // Phase 2: partial-layer score pass. Decodes only [0, N) on F tokens, extracts Q/K
 // from the partial graph and computes the cheap last-row proxy importance score.
 // Caller is responsible for memory_clear before invoking the resume decode.
+//
+// When n_query_positions > 1, uses SpecPrefill-style aggregation:
+//   - MAX over heads, MAX over layers, MEAN over query positions
+// The query positions are the last n_query_positions tokens of the prompt.
 static int self_layer_score_partial(
     llama_context * ctx,
     const llama_token * prompt_tokens,
     int n_prompt,
     int n_early_layers,
-    std::vector<float> & out_imp) {
+    std::vector<float> & out_imp,
+    bool use_max = false,
+    int n_query_positions = 1) {
     if (!ctx || !prompt_tokens || n_prompt <= 0 || n_early_layers < 1) {
         return -1;
     }
@@ -476,7 +753,20 @@ static int self_layer_score_partial(
     if (extract_qk_all_layers(*ctx, layers) != 0) {
         return -1;
     }
-    accumulate_range(layers, 0, n_early_layers, n_prompt - 1, out_imp);
+    
+    if (n_query_positions > 1) {
+        // SpecPrefill-style: use multiple query positions with max-max-mean
+        std::vector<int> query_positions;
+        int start_qi = std::max(0, n_prompt - n_query_positions);
+        for (int qi = start_qi; qi < n_prompt; qi++) {
+            query_positions.push_back(qi);
+        }
+        accumulate_range_multi_query(layers, 0, n_early_layers, query_positions, out_imp);
+    } else {
+        // Original: single query position (last token)
+        accumulate_range(layers, 0, n_early_layers, n_prompt - 1, out_imp, use_max);
+    }
+    
     if ((int) out_imp.size() != n_prompt) {
         fprintf(stderr, "[self-layer-prefill] partial score: imp size %zu != n_prompt %d\n",
                 out_imp.size(), n_prompt);
@@ -520,7 +810,18 @@ int llama_self_layer_prefill_partial(
         resume_tokens.assign(prompt_tokens, prompt_tokens + n_prompt);
     } else {
         std::vector<float> imp;
-        const int rs = self_layer_score_partial(ctx, prompt_tokens, n_prompt, P.n_early_layers, imp);
+        int rs;
+        
+        if (P.n_lookahead_tokens > 0) {
+            // SpecPrefill-style: generate look-ahead tokens via early exit, then score
+            rs = self_layer_score_with_lookahead(ctx, prompt_tokens, n_prompt, P.n_early_layers, 
+                                                  P.n_lookahead_tokens, imp, P.lookahead_temp);
+        } else {
+            // Original: use last token(s) of prompt as query
+            rs = self_layer_score_partial(ctx, prompt_tokens, n_prompt, P.n_early_layers, 
+                                          imp, P.use_max_aggregation, P.n_query_positions);
+        }
+        
         if (rs != 0) {
             return rs;
         }

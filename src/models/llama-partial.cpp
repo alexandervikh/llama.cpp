@@ -33,8 +33,13 @@ llm_build_llama_partial::llm_build_llama_partial(const llama_model & model, cons
     const int32_t il_end = il_end_raw > (int32_t) n_layer ? (int32_t) n_layer : il_end_raw;
     GGML_ASSERT(il_start >= 0 && il_start <= il_end && il_end <= (int32_t) n_layer);
 
-    const bool last_chunk  = (il_end == (int32_t) n_layer);
+    // When early_exit is true, apply output_norm + lm_head even at intermediate layers
+    const bool last_chunk  = (il_end == (int32_t) n_layer) || params.early_exit;
     const bool first_chunk = (il_start == 0);
+    
+    // For early_exit, we skip out_ids optimization to simplify buffer allocation.
+    // The regular last_chunk uses out_ids to select specific output tokens.
+    const bool use_out_ids = last_chunk && !params.early_exit;
 
     ggml_tensor * cur = nullptr;
     ggml_tensor * inpL;
@@ -52,7 +57,7 @@ llm_build_llama_partial::llm_build_llama_partial(const llama_model & model, cons
                             ? 1.0f / sqrtf(float(n_embd_head))
                             : hparams.f_attention_scale;
 
-    ggml_tensor * inp_out_ids = last_chunk ? build_inp_out_ids() : nullptr;
+    ggml_tensor * inp_out_ids = use_out_ids ? build_inp_out_ids() : nullptr;
 
     for (int il = il_start; il < il_end; ++il) {
         ggml_tensor * inpSA = inpL;
