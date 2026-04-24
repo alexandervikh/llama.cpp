@@ -189,6 +189,17 @@ int main(int argc, char ** argv) {
     }
     log_progress(args.verbose, "[init] Context created in %.1f ms\n", t_ctx_end - t_ctx_start);
 
+    // Initialize self-layer prefill caching for the fixed n_early value
+    // This pre-reserves the partial graph to avoid rebuild overhead on every call
+    log_progress(args.verbose, "[init] Initializing self-layer prefill cache (n_early=%d)...\n", n_early);
+    double t_slp_start = now_ms();
+    if (llama_self_layer_prefill_init(ctx, n_early) != 0) {
+        log_progress(args.verbose, "[init] Warning: failed to init SLP cache (will still work, but slower)\n");
+    } else {
+        double t_slp_end = now_ms();
+        log_progress(args.verbose, "[init] SLP cache initialized in %.1f ms\n", t_slp_end - t_slp_start);
+    }
+
     const double timeout_ms = args.timeout_sec * 1000.0;
 
     // Helper: run with timeout check (returns {result, elapsed_ms, timed_out})

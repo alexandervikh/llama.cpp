@@ -63,6 +63,20 @@ int llama_self_layer_prefill_with_kv_prune(
     int n_prompt,
     const llama_self_layer_prefill_params * params);
 
+// Initialize self-layer prefill caching for a fixed n_early value.
+// Call this once at startup to pre-cache the partial graph for layers [0, n_early).
+// This eliminates graph-rebuild overhead on every llama_self_layer_prefill_partial call.
+// Returns 0 on success, -1 on invalid n_early.
+int llama_self_layer_prefill_init(
+    struct llama_context * ctx,
+    int n_early);
+
+// Check if self-layer prefill caching is initialized.
+bool llama_self_layer_prefill_is_init(struct llama_context * ctx);
+
+// Get the cached n_early value (0 if not initialized).
+int llama_self_layer_prefill_get_n_early(struct llama_context * ctx);
+
 // Phase 2 (Option A, simplified): partial-layer score followed by full re-decode on the
 // kept tokens. Two passes:
 //

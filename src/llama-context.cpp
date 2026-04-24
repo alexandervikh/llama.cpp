@@ -1857,6 +1857,27 @@ int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_star
     return r;
 }
 
+int llama_context::init_self_layer_prefill(int32_t n_early) {
+    const int32_t n_layer_total = (int32_t) model.hparams.n_layer;
+
+    if (n_early <= 0 || n_early > n_layer_total) {
+        LLAMA_LOG_ERROR("%s: invalid n_early=%d (n_layer=%d)\n", __func__, n_early, n_layer_total);
+        return -1;
+    }
+
+    LLAMA_LOG_INFO("%s: initializing self-layer prefill with n_early=%d\n", __func__, n_early);
+
+    // Store the n_early value for reference
+    // Note: Graph caching for partial decode would require a dedicated scheduler
+    // per graph type to avoid interference between partial and full decodes.
+    // For now, we rely on the existing graph reuse mechanism in process_ubatch.
+    slp_n_early = n_early;
+
+    LLAMA_LOG_INFO("%s: self-layer prefill initialized (n_early=%d)\n", __func__, n_early);
+
+    return 0;
+}
+
 //
 // output
 //

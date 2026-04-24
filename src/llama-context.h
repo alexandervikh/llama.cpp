@@ -144,10 +144,24 @@ struct llama_context {
     // archs return -3.
     int decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end);
 
+    // Initialize self-layer prefill with a fixed n_early value.
+    // This pre-reserves a cached partial graph for layers [0, n_early) to avoid
+    // graph rebuild overhead on every call. Call once at startup if using
+    // self-layer prefill in production.
+    // Returns 0 on success, -1 on error.
+    int init_self_layer_prefill(int32_t n_early);
+
+    // Check if self-layer prefill caching is enabled
+    bool self_layer_prefill_enabled() const { return slp_n_early > 0; }
+    int32_t self_layer_prefill_n_early() const { return slp_n_early; }
+
     // Hidden-state slot for cross-call partial decode.
     int32_t partial_il_start_pending = 0;
     int32_t partial_il_end_pending   = -1;
     llm_graph_type decode_gtype      = LLM_GRAPH_TYPE_DECODER;
+
+    // Self-layer prefill cached n_early (0 = not initialized)
+    int32_t slp_n_early = 0;
 
     //
     // state save/load

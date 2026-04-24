@@ -597,3 +597,18 @@ int llama_self_layer_prefill(
     }
     return (int) ft.size();
 }
+
+int llama_self_layer_prefill_init(struct llama_context * ctx, int n_early) {
+    if (!ctx) {
+        return -1;
+    }
+    return ctx->init_self_layer_prefill(n_early);
+}
+
+bool llama_self_layer_prefill_is_init(struct llama_context * ctx) {
+    return ctx && ctx->self_layer_prefill_enabled();
+}
+
+int llama_self_layer_prefill_get_n_early(struct llama_context * ctx) {
+    return ctx ? ctx->self_layer_prefill_n_early() : 0;
+}
