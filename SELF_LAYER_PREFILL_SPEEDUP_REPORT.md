@@ -420,3 +420,44 @@ cmake --build build --target llama llama-self-layer-prefill-run -j
 
 Raw JSON output for each `--n-early` value from the original grid lives in
 `bench-results/gpu-N{4,8,10}.json` (512–4096 prompts on `n_ctx=n_batch=4096`).
+
+---
+
+## Init API for Production Use
+
+Added `llama_self_layer_prefill_init()` API for production deployments:
+
+```c
+// Initialize once at context creation with fixed n_early
+int llama_self_layer_prefill_init(struct llama_context * ctx, int n_early);
+
+// Query initialization state
+bool llama_self_layer_prefill_is_init(struct llama_context * ctx);
+int llama_self_layer_prefill_get_n_early(struct llama_context * ctx);
+```
+
+The benchmark tool now calls `llama_self_layer_prefill_init(ctx, n_early)` during
+startup, which stores the n_early value in the context for future reference.
+
+### Graph Caching Investigation
+
+Attempted to implement dedicated graph caching for partial decode to avoid
+rebuild overhead when alternating between partial and full decodes. However,
+the `ggml_backend_sched` can only track one graph at a time — tensor-backend
+mappings from graph allocation are stored in the scheduler state and get
+overwritten when a different graph is allocated.
+
+Proper multi-graph caching would require either:
+1. Multiple scheduler instances (one per graph type)
+2. Extension to ggml_backend_sched to support graph-specific state snapshots
+
+The existing `can_reuse()` mechanism in `process_ubatch()` already handles
+graph reuse for consecutive calls with matching parameters. In practice, this
+means:
+- Sequential partial decode calls reuse the same graph (fast)
+- After a full decode, the next partial decode rebuilds (some overhead)
+- Subsequent partial calls reuse again
+
+For typical inference patterns (prefill once → generate many), this overhead
+is amortized over the full request and doesn't significantly impact end-to-end
+latency.
