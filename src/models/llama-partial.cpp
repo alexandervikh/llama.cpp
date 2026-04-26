@@ -1,4 +1,5 @@
 #include "models.h"
+#include "lazyllm-pool.h"
 
 // Partial layer-range Llama graph builder. This is a clone of llm_build_llama<false>
 // (src/models/llama.cpp) with the layer loop parameterised on [il_start, il_end).
@@ -186,10 +187,17 @@ llm_build_llama_partial::llm_build_llama_partial(const llama_model & model, cons
     } else {
         // Intermediate chunk: expose the residual stream as t_embd so callers can copy
         // it back and feed it into the next partial-resume invocation.
-        cb(cur, "partial_h_out", -1);
+        // NOTE: do NOT rename with cb() here — the tensor already carries the "l_out-N"
+        // name from the layer loop above. Renaming it to "partial_h_out" would overwrite
+        // that name and break tensor extraction by name in llama-lazyllm.cpp.
         res->t_embd = cur;
     }
 
     GGML_UNUSED(first_chunk);
+
+    // GPU-side attention score pooling (Fix 1): reduces kq_soft_max to
+    // per-key-position scores on the GPU, avoiding huge CPU↔GPU transfers.
+    lazyllm_add_score_pool(ctx0, gf, il_start, il_end);
+
     ggml_build_forward_expand(gf, cur);
 }

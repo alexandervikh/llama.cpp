@@ -144,7 +144,11 @@ struct llama_context {
     //   (for look-ahead token generation using early layers as a "draft model").
     // Note: only LLM_ARCH_LLAMA / LLAMA4 (single-graph variant) is supported. Other
     // archs return -3.
-    int decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end, bool early_exit = false);
+    // no_embed_output: when true, skip cparams.embeddings=true for intermediate chunks.
+    // Use when the caller will extract tensors directly via get_gf_res_prev() instead
+    // of going through the embedding output buffer. This avoids allocating n_vocab*n_tokens
+    // output buffers (~591 MB for 1001 tokens), which is the primary perf bottleneck.
+    int decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end, bool early_exit = false, bool no_embed_output = false);
 
     // Initialize self-layer prefill with a fixed n_early value.
     // This pre-reserves a cached partial graph for layers [0, n_early) to avoid

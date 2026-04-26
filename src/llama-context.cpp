@@ -1813,7 +1813,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     return 0;
 }
 
-int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end, bool early_exit) {
+int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_start, int32_t il_end, bool early_exit, bool no_embed_output) {
     const int32_t n_layer_total = (int32_t) model.hparams.n_layer;
 
     if (il_end < 0) il_end = n_layer_total;
@@ -1845,8 +1845,12 @@ int llama_context::decode_partial(const llama_batch & batch_inp, int32_t il_star
 
     // Force embeddings extraction whenever the chunk does not end at the model output;
     // otherwise standard logits-only behaviour. Restore on exit.
+    // Exception: no_embed_output=true means the caller will extract tensors directly
+    // from the compute graph (via get_gf_res_prev()) instead of the output buffer.
+    // This avoids output_reserve(n_tokens) allocating n_vocab*n_tokens*sizeof(float)
+    // (~600 MB for 1001 tokens), which is a massive performance bottleneck.
     const bool save_embeddings = cparams.embeddings;
-    if (!last_chunk) {
+    if (!last_chunk && !no_embed_output) {
         cparams.embeddings = true;
     }
 

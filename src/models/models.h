@@ -462,6 +462,10 @@ struct llm_build_openai_moe_iswa : public llm_graph_context {
     llm_build_openai_moe_iswa(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_openai_moe_partial : public llm_graph_context {
+    llm_build_openai_moe_partial(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_openelm : public llm_graph_context {
     llm_build_openelm(const llama_model & model, const llm_graph_params & params);
 };
@@ -506,6 +510,14 @@ struct llm_build_plm : public llm_graph_context {
 
 struct llm_build_qwen2 : public llm_graph_context {
     llm_build_qwen2(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_qwen2_partial : public llm_graph_context {
+    llm_build_qwen2_partial(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_qwen3_partial : public llm_graph_context {
+    llm_build_qwen3_partial(const llama_model & model, const llm_graph_params & params);
 };
 
 struct llm_build_qwen2moe : public llm_graph_context {

@@ -34,6 +34,7 @@ add_library(llama
             llama-sampler.cpp
             llama-spec-prefill.cpp
             llama-self-layer-prefill.cpp
+            llama-lazyllm.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
@@ -108,6 +109,7 @@ add_library(llama
             models/olmo2.cpp
             models/olmoe.cpp
             models/openai-moe-iswa.cpp
+            models/openai-moe-partial.cpp
             models/openelm.cpp
             models/orion.cpp
             models/pangu-embedded.cpp
@@ -119,6 +121,8 @@ add_library(llama
             models/plm.cpp
             models/qwen.cpp
             models/qwen2.cpp
+            models/qwen2-partial.cpp
+            models/qwen3-partial.cpp
             models/qwen2moe.cpp
             models/qwen2vl.cpp
             models/qwen3.cpp

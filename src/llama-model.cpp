@@ -8037,11 +8037,30 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // through to their full builders below (which is also fine when il_start==0 and
     // il_end==n_layer, i.e. the partial bounds are the trivial "everything" range).
     if (params.gtype == LLM_GRAPH_TYPE_PARTIAL) {
-        const bool can_partial =
+        const bool is_llama_partial =
             arch == LLM_ARCH_LLAMA ||
             (arch == LLM_ARCH_LLAMA4 && hparams.swa_type == LLAMA_SWA_TYPE_NONE);
-        if (can_partial) {
+        const bool is_qwen2_partial     = arch == LLM_ARCH_QWEN2;
+        const bool is_qwen3_partial     = arch == LLM_ARCH_QWEN3;
+        const bool is_openai_moe_partial = arch == LLM_ARCH_OPENAI_MOE;
+
+        if (is_llama_partial) {
             llm = std::make_unique<llm_build_llama_partial>(*this, params);
+            llm->res->set_params(params);
+            return llm->res->get_gf();
+        }
+        if (is_qwen2_partial) {
+            llm = std::make_unique<llm_build_qwen2_partial>(*this, params);
+            llm->res->set_params(params);
+            return llm->res->get_gf();
+        }
+        if (is_qwen3_partial) {
+            llm = std::make_unique<llm_build_qwen3_partial>(*this, params);
+            llm->res->set_params(params);
+            return llm->res->get_gf();
+        }
+        if (is_openai_moe_partial) {
+            llm = std::make_unique<llm_build_openai_moe_partial>(*this, params);
             llm->res->set_params(params);
             return llm->res->get_gf();
         }

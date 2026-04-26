@@ -270,6 +270,11 @@ unset(LLAMA_TEST_NAME)
 llama_build(test-self-layer-prefill.cpp)
 target_include_directories(test-self-layer-prefill PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+# LazyLLM unit tests
+unset(LLAMA_TEST_NAME)
+llama_build(test-lazyllm-extract.cpp)
+target_include_directories(test-lazyllm-extract PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 # Speculative prefill POC tests
 unset(LLAMA_TEST_NAME)
 llama_build(test-spec-prefill.cpp)

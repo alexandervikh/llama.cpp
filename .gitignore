@@ -160,6 +160,24 @@ core.*
 # Validation docs (test artifacts, not part of source tree)
 SPEC_PREFILL_FINAL_REPORT.md
 VALIDATION_SUMMARY.md
+SELF_LAYER_PREFILL_EARLY_EXIT_SUMMARY.md
 
 # CMake download artifacts
 ggml/src/kompute/
+uv.lock
+bench-results/**
+
+# LazyLLM benchmark results (raw CSVs and logs — keep report .md files only)
+quality-results/**/*.csv
+quality-results-fix2/**/*.csv
+quality-results-fix2/**/*.err
+quality-results-fix2/**/*.stdout
+quality-results-fix2/**/gpt-oss-20b-2k.csv
+quality-results-fix2/**/gpt-oss-20b-4k.*
+quality-results/**/lazyllm-phase6*.md
+quality-results/**/longbench-cpp-bench-report.md
+quality-results/**/qwen3-0.6b-cpu-v2-report.md
+report2304*.md
+
+# LongBench dataset zip (large binary)
+datasets/longbench/data.zip

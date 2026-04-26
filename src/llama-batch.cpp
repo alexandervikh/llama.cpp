@@ -294,7 +294,11 @@ bool llama_batch_allocr::init(
 
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-            if (p0 >= 0) {
+            // Embedding-injection batches (batch.embd != nullptr) carry hidden
+            // states for a pruned-token subset at their ORIGINAL position IDs.
+            // They legitimately start at positions other than KV_max+1 and may
+            // have non-contiguous positions. Skip both continuity checks.
+            if (!batch.embd && p0 >= 0) {
                 bool ok = true;
 
                 if (seq_pos_min(s) != p0 + 1) {
@@ -313,7 +317,7 @@ bool llama_batch_allocr::init(
                 }
             }
 
-            if (seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
+            if (!batch.embd && seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
                 LLAMA_LOG_ERROR("%s: sequence %d positions are not continuous\n", __func__, s);
                 return false;
             }
