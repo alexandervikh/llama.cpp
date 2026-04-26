@@ -104,6 +104,7 @@ struct Args {
     float    decode_keep_ratio = 0.7f;
     int      n_prompts        = -1;   // max prompts to evaluate (-1 = all)
     bool     verbose          = false;
+    bool     no_fa            = false; // disable flash attention (for debugging)
 };
 
 static void print_usage(const char * prog) {
@@ -124,6 +125,7 @@ static void print_usage(const char * prog) {
         << "  --n-gpu-layers N           layers to offload to GPU (default: 0)\n"
         << "  --decode-pruning           enable Phase 5 decode KV pruning\n"
         << "  --decode-keep-ratio 0.7    (default: 0.7)\n"
+        << "  --no-flash-attn            disable flash attention (default: enabled)\n"
         << "  --verbose                  verbose logging\n";
 }
 
@@ -149,7 +151,8 @@ static bool parse_args(int argc, char ** argv, Args & a) {
         } else if (arg == "--keep-ratios") {
             a.keep_ratios.clear();
             while (i + 1 < argc && argv[i+1][0] != '-') a.keep_ratios.push_back(std::stof(argv[++i]));
-        } else {
+        } else if (arg == "--no-flash-attn")              { a.no_fa = true; }
+        else {
             std::cerr << "Unknown arg: " << arg << "\n";
             return false;
         }
@@ -405,7 +408,11 @@ int main(int argc, char ** argv) {
     cp.n_ctx              = args.n_ctx;
     cp.n_batch            = args.n_ctx;
     cp.n_ubatch           = args.n_ctx;
-    cp.flash_attn_type    = LLAMA_FLASH_ATTN_TYPE_DISABLED;  // required for kq_soft_max extraction
+    // FA is now supported: lazyllm-pool.h falls back to Q×K side-branch when
+    // kq_soft_max is absent (FA mode).  Use LLAMA_FLASH_ATTN_TYPE_ON for speed;
+    // override with --no-flash-attn if the GPU doesn't support it.
+    cp.flash_attn_type    = args.no_fa ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+                                       : LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { std::cerr << "Failed to create context\n"; llama_model_free(model); return 1; }
