@@ -611,12 +611,15 @@ int llama_lazyllm_prefill(
 
     // --- Stage 0: first decode_partial on full token batch ---
     const int l0 = P.pruning_layers[0];
+    const double t_s0_start = lazyllm_now_ms();
     int r = lctx->decode_partial(batch, 0, l0, /*early_exit=*/false, /*no_embed_output=*/true);
     if (r != 0) {
         fprintf(stderr, "[lazyllm] prefill: decode_partial [0,%d) stage 0 failed: %d\n", l0, r);
         return -1;
     }
     lctx->synchronize();
+    if (P.verbose) fprintf(stderr, "[lazyllm] prefill: stage 0 decode_partial[0,%d) %.1f ms\n",
+                           l0, lazyllm_now_ms() - t_s0_start);
 
     // surviving_indices tracks which ORIGINAL token indices are still active.
     std::vector<int32_t> surviving(batch.n_tokens);
@@ -801,6 +804,81 @@ int llama_lazyllm_prefill(
     }
 
     return (int)surviving.size();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Warmup: pre-compile all partial CUDA graph configurations
+// ─────────────────────────────────────────────────────────────────────────────
+
+int llama_lazyllm_warmup(
+        struct llama_lazyllm_context * ctx,
+        const struct llama_batch    & batch) {
+    if (!ctx || !ctx->ctx_base) return -1;
+    if (batch.n_tokens <= 0) return -1;
+
+    const llama_lazyllm_params & P = ctx->params;
+    llama_context * lctx = ctx->ctx_base;
+
+    if (P.verbose) {
+        fprintf(stderr, "[lazyllm] warmup: pre-compiling %d partial graph configurations "
+                "for %d tokens...\n", (int)P.pruning_layers.size() + 1, batch.n_tokens);
+    }
+
+    // Phase 1: Forward warmup — run all stages in order to compile CUDA kernels
+    // for every (il_start, il_end, n_tokens) configuration.
+    const double t0 = lazyllm_now_ms();
+    llama_lazyllm_prefill(ctx, batch);
+    lctx->synchronize();
+    const double t_phase1 = lazyllm_now_ms() - t0;
+
+    if (P.verbose) {
+        fprintf(stderr, "[lazyllm] warmup: phase 1 (kernel compile) %.1f ms\n", t_phase1);
+    }
+
+    // Phase 2: Prime the ggml allocator (galloc) for stage 0.
+    //
+    // Root cause of the 1.6 s per-prompt overhead:
+    //   ggml_gallocr_needs_realloc() returns true whenever the graph's n_nodes
+    //   count differs from what the galloc last saw.  After phase 1, galloc holds
+    //   the node-count of the *last* partial stage (smallest graph).  The timed
+    //   run starts with stage 0 (largest graph, n_nodes = N0), causing a "slow
+    //   path" that calls ggml_backend_synchronize + ggml_gallocr_reserve_n — the
+    //   source of the ~1600 ms hit on the very first timed call.
+    //
+    // Fix: after phase 1, clear the KV cache and run stage 0 one more time so
+    //   that galloc ends up with N0 nodes and stage-0 tensor-size_max values.
+    //   The timed run's first stage-0 decode_partial then finds:
+    //     • galloc->n_nodes == graph->n_nodes   (N0 == N0) → no realloc needed
+    //     • all tensor sizes ≤ size_max           (same or fewer tokens) → fits
+    //   and takes the galloc fast path (~0.1 ms vs ~1600 ms).
+    if (!P.pruning_layers.empty()) {
+        const int l0 = P.pruning_layers[0];
+        llama_memory_clear(llama_get_memory(lctx), false);
+
+        const double t1 = lazyllm_now_ms();
+        // Run stage 0 without embedding output — this primes galloc and also
+        // pre-warms any CUDA kernels specific to stage 0's graph structure.
+        lctx->decode_partial(batch, 0, l0, /*early_exit=*/false, /*no_embed_output=*/true);
+        lctx->synchronize();
+        const double t_phase2 = lazyllm_now_ms() - t1;
+
+        if (P.verbose) {
+            fprintf(stderr, "[lazyllm] warmup: phase 2 (galloc prime stage 0) %.1f ms\n", t_phase2);
+        }
+    }
+
+    // Reset context state so the warmup doesn't affect subsequent calls.
+    llama_memory_clear(llama_get_memory(lctx), false);
+    ctx->kept_indices.clear();
+    ctx->last_scores.clear();
+    if (ctx->aux_cache_enabled) ctx->aux_cache.reset();
+
+    const double t_total = lazyllm_now_ms() - t0;
+    if (P.verbose) {
+        fprintf(stderr, "[lazyllm] warmup: total %.1f ms\n", t_total);
+    }
+
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

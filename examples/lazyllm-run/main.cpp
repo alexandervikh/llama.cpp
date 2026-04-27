@@ -214,9 +214,12 @@ static std::string generate_tokens(
         llama_token first_tok,
         llama_pos start_pos,
         int n_gen,
-        llama_seq_id seq_id = 0) {
+        llama_seq_id seq_id = 0,
+        double * out_tpot_ms = nullptr) {  // optional: average ms per decode step
     std::string out;
     llama_token tok = first_tok;
+    int n_steps = 0;
+    double total_decode_ms = 0.0;
     for (int t = 0; t < n_gen && tok >= 0; t++) {
         // decode tok to text
         char buf[256] = {};
@@ -236,15 +239,20 @@ static std::string generate_tokens(
         dec.logits[0]    = 1;
 
         int r;
+        auto td0 = Clock::now();
         if (lz_ctx && lz_ctx->decode_pruning_enabled)
             r = llama_lazyllm_decode_step(lz_ctx, dec) >= 0 ? 0 : -1;
         else
             r = llama_decode(ctx, dec);
+        auto td1 = Clock::now();
 
         llama_batch_free(dec);
         if (r != 0) break;
         tok = sample_greedy(ctx, vocab);
+        total_decode_ms += elapsed_ms(td0, td1);
+        ++n_steps;
     }
+    if (out_tpot_ms && n_steps > 0) *out_tpot_ms = total_decode_ms / n_steps;
     return out;
 }
 
@@ -266,6 +274,8 @@ struct PromptResult {
     double      lazyllm_ttft_ms    = 0;
     double      speedup            = 0;
     int         n_kept             = 0;
+    double      baseline_tpot_ms   = 0;  // ms per decode step (baseline)
+    double      lazyllm_tpot_ms    = 0;  // ms per decode step (lazyllm)
     std::string baseline_output;
     std::string lazyllm_output;
     std::vector<std::string> answers;   // ground-truth answers
@@ -296,6 +306,7 @@ static PromptResult bench_prompt(
             const_cast<llama_token*>(tokens.data()), (int32_t)tokens.size());
         auto t0 = Clock::now();
         if (llama_decode(ctx, b) != 0) continue;
+        llama_synchronize(ctx);  // wait for GPU to finish (matches LazyLLM's synchronize())
         bl_times.push_back(elapsed_ms(t0, Clock::now()));
     }
     res.baseline_ttft_ms = median(bl_times);
@@ -308,11 +319,27 @@ static PromptResult bench_prompt(
         if (llama_decode(ctx, b) == 0) {
             llama_token first = sample_greedy(ctx, vocab);
             res.baseline_output = generate_tokens(ctx, nullptr, vocab, first,
-                                                  (llama_pos)tokens.size(), max_tokens);
+                                                  (llama_pos)tokens.size(), max_tokens,
+                                                  0, &res.baseline_tpot_ms);
         }
     }
 
     /* ── LazyLLM ── */
+    // Warmup: run one dummy prefill to pre-compile all partial CUDA kernel
+    // configurations. The warmup result is discarded; subsequent timed runs
+    // use already-compiled kernels.
+    {
+        llama_memory_clear(llama_get_memory(ctx), false);
+        llama_lazyllm_context * wctx = llama_lazyllm_init_with_params(ctx, lz_params);
+        if (wctx) {
+            llama_batch wb = llama_batch_get_one(
+                const_cast<llama_token*>(tokens.data()), (int32_t)tokens.size());
+            llama_lazyllm_warmup(wctx, wb);
+            llama_lazyllm_free(wctx);
+        }
+        llama_memory_clear(llama_get_memory(ctx), false);
+    }
+
     std::vector<double> lz_times;
     for (int r = 0; r < repeat; r++) {
         llama_memory_clear(llama_get_memory(ctx), false);
@@ -368,8 +395,9 @@ static PromptResult bench_prompt(
                 llama_batch kb = llama_batch_get_one(
                     kept_tokens.data(), (int32_t)kept_tokens.size());
                 if (llama_decode(ctx, kb) == 0) {
-                    res.lazyllm_output = generate_tokens(ctx, nullptr, vocab, first,
-                                                         (llama_pos)kept_tokens.size(), max_tokens);
+                    res.lazyllm_output = generate_tokens(ctx, lz_ctx, vocab, first,
+                                                         (llama_pos)kept_tokens.size(), max_tokens,
+                                                         0, &res.lazyllm_tpot_ms);
                 }
             }
             llama_lazyllm_free(lz_ctx);
@@ -434,10 +462,12 @@ int main(int argc, char ** argv) {
         if (!args.out_csv.empty()) {
             csv.open(args.out_csv);
             if (csv) csv << "id,n_prompt,n_kept,baseline_ttft_ms,lazyllm_ttft_ms,speedup,"
+                            "baseline_tpot_ms,lazyllm_tpot_ms,"
                             "baseline_output,lazyllm_output,answers\n";
         }
 
         std::vector<double> all_baseline, all_lazyllm, all_speedup;
+        std::vector<PromptResult> results;
         int n_done = 0;
 
         // Print config
@@ -503,6 +533,7 @@ int main(int argc, char ** argv) {
             all_baseline.push_back(res.baseline_ttft_ms);
             all_lazyllm.push_back(res.lazyllm_ttft_ms);
             all_speedup.push_back(res.speedup);
+            results.push_back(res);
 
             // compact output line
             const std::string bl_snip = res.baseline_output.size() > 25
@@ -534,6 +565,9 @@ int main(int argc, char ** argv) {
                     << res.baseline_ttft_ms << ","
                     << res.lazyllm_ttft_ms << ","
                     << std::setprecision(3) << res.speedup << ","
+                    << std::setprecision(2)
+                    << res.baseline_tpot_ms << ","
+                    << res.lazyllm_tpot_ms << ","
                     << csv_escape(res.baseline_output) << ","
                     << csv_escape(res.lazyllm_output) << ","
                     << csv_escape(ans_str) << "\n";
@@ -548,6 +582,13 @@ int main(int argc, char ** argv) {
             const double med_sp = median(all_speedup);
             const double iqr_sp = iqr(all_speedup);
 
+            // Aggregate TPOT across all results
+            std::vector<double> all_bl_tpot, all_lz_tpot;
+            for (const auto & r : results) {
+                if (r.baseline_tpot_ms > 0) all_bl_tpot.push_back(r.baseline_tpot_ms);
+                if (r.lazyllm_tpot_ms  > 0) all_lz_tpot.push_back(r.lazyllm_tpot_ms);
+            }
+
             std::cout << "\n" << std::string(80, '=') << "\n";
             std::cout << "Prompts evaluated   : " << n_done << "\n";
             std::cout << "Median baseline TTFT: " << std::fixed << std::setprecision(1) << med_bl << " ms\n";
@@ -556,6 +597,15 @@ int main(int argc, char ** argv) {
                       << "x  (IQR=" << std::setprecision(3) << iqr_sp << "x)\n";
             const char * gate = med_sp >= 2.0 ? "PASS" : (med_sp >= 1.5 ? "PARTIAL" : "FAIL");
             std::cout << "Gate TTFT >= 2.0x   : " << gate << " (" << std::setprecision(2) << med_sp << "x)\n";
+            if (!all_bl_tpot.empty()) {
+                double med_bl_tpot = median(all_bl_tpot);
+                double med_lz_tpot = all_lz_tpot.empty() ? 0 : median(all_lz_tpot);
+                double tpot_speedup = (med_lz_tpot > 0) ? med_bl_tpot / med_lz_tpot : 0;
+                std::cout << "Median baseline TPOT: " << std::setprecision(2) << med_bl_tpot << " ms/tok\n";
+                std::cout << "Median LazyLLM TPOT : " << med_lz_tpot << " ms/tok\n";
+                if (tpot_speedup > 0)
+                    std::cout << "TPOT speedup        : " << std::setprecision(3) << tpot_speedup << "x\n";
+            }
             if (!args.out_csv.empty())
                 std::cout << "Per-prompt CSV      : " << args.out_csv << "\n";
             std::cout << "(Run scripts/score-f1.py " << args.out_csv << " to compute F1)\n";
@@ -597,12 +647,23 @@ int main(int argc, char ** argv) {
     if (args.decode_pruning) std::cout << " decode_pruning=on keep_ratio=" << args.decode_keep_ratio;
     std::cout << "\n";
 
-    /* warmup */
+    /* warmup: pre-compile baseline and LazyLLM partial CUDA kernels */
     std::cout << "Warming up...\n";
     for (int w = 0; w < 2; w++) {
         llama_memory_clear(llama_get_memory(ctx), false);
         llama_batch b = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
         llama_decode(ctx, b);
+    }
+    {
+        // Also warmup all LazyLLM partial graph configurations.
+        llama_memory_clear(llama_get_memory(ctx), false);
+        llama_lazyllm_context * wctx = llama_lazyllm_init_with_params(ctx, lz_params);
+        if (wctx) {
+            llama_batch wb = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+            llama_lazyllm_warmup(wctx, wb);
+            llama_lazyllm_free(wctx);
+        }
+        llama_memory_clear(llama_get_memory(ctx), false);
     }
 
     std::ofstream csv_out;
@@ -619,6 +680,7 @@ int main(int argc, char ** argv) {
         llama_batch bb = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
         auto t0 = Clock::now();
         int ret = llama_decode(ctx, bb);
+        llama_synchronize(ctx);  // wait for GPU completion
         auto t1 = Clock::now();
         if (ret != 0) { std::cerr << "baseline decode failed\n"; continue; }
         const double b_ms = elapsed_ms(t0, t1);

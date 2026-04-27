@@ -206,6 +206,17 @@ int llama_lazyllm_prefill(
     struct llama_lazyllm_context * ctx,
     const struct llama_batch & batch);
 
+// Warmup: pre-compile all partial CUDA graph configurations used by this ctx.
+// Call once before the first timed llama_lazyllm_prefill.  After warmup, all
+// partial CUDA kernels are compiled and cached, eliminating JIT overhead.
+//
+// batch: a representative batch (same n_tokens as the real batch; content
+//        does not matter — the warmup is discarded).
+// Returns 0 on success.
+int llama_lazyllm_warmup(
+    struct llama_lazyllm_context * ctx,
+    const struct llama_batch & batch);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Aux Cache API
 // ─────────────────────────────────────────────────────────────────────────────
