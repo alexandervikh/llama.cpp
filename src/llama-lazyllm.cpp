@@ -902,28 +902,38 @@ int llama_lazyllm_warmup(
     double t_lazy_ms = 0.0;
 
     if (P.auto_fallback && !P.pruning_layers.empty()) {
-        // === Baseline measurement (steady-state) ===
-        // Untimed warm-up: compiles full-graph kernels for batch.n_tokens
-        // (which Phase 1 did NOT do — its last stage runs on n_kept tokens, not
-        // the full prompt).  Also primes galloc for the full graph.
+        // === A/B speed test: 3 timed reps per side, drop the first (cold-start),
+        //     average the remaining two as the steady-state estimate.
+        //
+        // One timed rep is insufficient: at large token counts the first rep
+        // suffers from cold-start effects (CUDA kernel variants not yet compiled
+        // for the specific token count, allocator plan not yet warm) that make
+        // baseline appear artificially slow and cause a wrong "use LazyLLM"
+        // decision even when LazyLLM is actually slower.  Three reps ensure the
+        // 2nd and 3rd measurements reflect true steady-state performance.
+
+        // === Baseline measurement ===
+        // Untimed warm-up: compiles full-graph kernels for batch.n_tokens.
         llama_memory_clear(llama_get_memory(lctx), false);
         if (llama_decode(lctx, batch) != 0) {
             if (P.verbose) fprintf(stderr, "[lazyllm] warmup: baseline warm-up failed\n");
         }
         lctx->synchronize();
 
-        // Timed baseline: galloc warm from previous baseline → realistic.
-        llama_memory_clear(llama_get_memory(lctx), false);
-        const double tb0 = lazyllm_now_ms();
-        const int rb = llama_decode(lctx, batch);
-        lctx->synchronize();
-        t_base_ms = lazyllm_now_ms() - tb0;
-        if (rb != 0) t_base_ms = 0.0;
+        // 3 timed reps; drop rep 0 (still warming), average reps 1 and 2.
+        double base_samples[3] = {0.0, 0.0, 0.0};
+        bool   base_ok = true;
+        for (int ri = 0; ri < 3; ri++) {
+            llama_memory_clear(llama_get_memory(lctx), false);
+            const double tb0 = lazyllm_now_ms();
+            if (llama_decode(lctx, batch) != 0) { base_ok = false; break; }
+            lctx->synchronize();
+            base_samples[ri] = lazyllm_now_ms() - tb0;
+        }
+        t_base_ms = base_ok ? (base_samples[1] + base_samples[2]) / 2.0 : 0.0;
 
-        // === LazyLLM measurement (steady-state) ===
-        // Untimed warm-up: cycles galloc through all lazyllm stages (Phase 1
-        // did this already, but the intervening baseline runs reset galloc to
-        // full-graph state).
+        // === LazyLLM measurement ===
+        // Untimed warm-up: cycles galloc through all lazyllm stages.
         llama_memory_clear(llama_get_memory(lctx), false);
         ctx->kept_indices.clear();
         ctx->last_scores.clear();
@@ -931,22 +941,27 @@ int llama_lazyllm_warmup(
         llama_lazyllm_prefill(ctx, batch);
         lctx->synchronize();
 
-        // Timed lazyllm: galloc state from previous lazyllm (stage N) → first
-        // stage will incur realloc → matches what each benchmark rep sees.
-        llama_memory_clear(llama_get_memory(lctx), false);
-        ctx->kept_indices.clear();
-        ctx->last_scores.clear();
-        if (ctx->aux_cache_enabled) ctx->aux_cache.reset();
-        const double tl0 = lazyllm_now_ms();
-        const int rl = llama_lazyllm_prefill(ctx, batch);
-        lctx->synchronize();
-        t_lazy_ms = lazyllm_now_ms() - tl0;
+        // 3 timed reps; drop rep 0, average reps 1 and 2.
+        double lazy_samples[3] = {0.0, 0.0, 0.0};
+        int    last_rl = -1;
+        for (int ri = 0; ri < 3; ri++) {
+            llama_memory_clear(llama_get_memory(lctx), false);
+            ctx->kept_indices.clear();
+            ctx->last_scores.clear();
+            if (ctx->aux_cache_enabled) ctx->aux_cache.reset();
+            const double tl0 = lazyllm_now_ms();
+            last_rl = llama_lazyllm_prefill(ctx, batch);
+            lctx->synchronize();
+            lazy_samples[ri] = lazyllm_now_ms() - tl0;
+            if (last_rl < 0) break;
+        }
+        t_lazy_ms = (last_rl >= 0) ? (lazy_samples[1] + lazy_samples[2]) / 2.0 : 0.0;
 
         ctx->warmup_baseline_ms = t_base_ms;
         ctx->warmup_lazyllm_ms  = t_lazy_ms;
 
         // Decision: enable fallback unless LazyLLM is meaningfully faster.
-        if (rl >= 0 && t_base_ms > 0.0 &&
+        if (last_rl >= 0 && t_base_ms > 0.0 &&
             t_lazy_ms * P.auto_fallback_min_speedup > t_base_ms) {
             ctx->fallback_active = true;
         } else {
