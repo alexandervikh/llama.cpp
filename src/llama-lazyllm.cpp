@@ -588,8 +588,25 @@ int llama_lazyllm_prefill(
     if (batch.n_tokens <= 0) return -1;
 
     const llama_lazyllm_params & P = ctx->params;
-    if (P.pruning_layers.empty()) {
-        return llama_decode(ctx->ctx_base, batch);
+
+    // Auto-fallback: if warmup decided LazyLLM is not faster than baseline,
+    // transparently call llama_decode() so the user is never worse off.
+    // Also handles the empty-schedule case.
+    if (P.pruning_layers.empty() || ctx->fallback_active) {
+        const int r = llama_decode(ctx->ctx_base, batch);
+        if (r != 0) return -1;
+        // Populate the post-prefill state as if all tokens survived.
+        const int32_t n = batch.n_tokens;
+        ctx->kept_indices.resize((size_t)n);
+        std::iota(ctx->kept_indices.begin(), ctx->kept_indices.end(), 0);
+        ctx->alive_positions.resize((size_t)n);
+        for (int32_t i = 0; i < n; i++) {
+            ctx->alive_positions[(size_t)i] = batch.pos
+                ? batch.pos[i]
+                : (llama_pos)i;
+        }
+        ctx->decode_step = 0;
+        return n;
     }
 
     const int n_schedules = (int)P.pruning_layers.size();
@@ -825,7 +842,9 @@ int llama_lazyllm_warmup(
     }
 
     // Phase 1: Forward warmup — run all stages in order to compile CUDA kernels
-    // for every (il_start, il_end, n_tokens) configuration.
+    // for every (il_start, il_end, n_tokens) configuration.  After this, the
+    // last graph executed is the FULL forward (stage N), so plain llama_decode
+    // kernels are also compiled.
     const double t0 = lazyllm_now_ms();
     llama_lazyllm_prefill(ctx, batch);
     lctx->synchronize();
@@ -865,6 +884,95 @@ int llama_lazyllm_warmup(
         if (P.verbose) {
             fprintf(stderr, "[lazyllm] warmup: phase 2 (galloc prime stage 0) %.1f ms\n", t_phase2);
         }
+    }
+
+    // Phase 3: A/B speed test — time baseline llama_decode and lazyllm prefill
+    // under realistic STEADY-STATE conditions.  Sets ctx->fallback_active if
+    // LazyLLM is not faster than baseline (e.g. on multi-GPU layer-split or
+    // short prompts where the multi-stage overhead dominates).  This guarantees
+    // LazyLLM mode never performs worse than baseline.
+    //
+    // Critical: each test gets one untimed warm-up call so that the timed run
+    // sees the same galloc state it would see in a benchmark loop's 2nd+ rep:
+    //   • baseline timed: prev call was baseline → galloc in full-graph state →
+    //     no realloc → fast.  This matches steady-state baseline behavior.
+    //   • lazyllm timed:  prev call was lazyllm  → galloc in last-stage state →
+    //     stage 0 needs realloc → slow.  This matches steady-state lazyllm.
+    double t_base_ms = 0.0;
+    double t_lazy_ms = 0.0;
+
+    if (P.auto_fallback && !P.pruning_layers.empty()) {
+        // === Baseline measurement (steady-state) ===
+        // Untimed warm-up: compiles full-graph kernels for batch.n_tokens
+        // (which Phase 1 did NOT do — its last stage runs on n_kept tokens, not
+        // the full prompt).  Also primes galloc for the full graph.
+        llama_memory_clear(llama_get_memory(lctx), false);
+        if (llama_decode(lctx, batch) != 0) {
+            if (P.verbose) fprintf(stderr, "[lazyllm] warmup: baseline warm-up failed\n");
+        }
+        lctx->synchronize();
+
+        // Timed baseline: galloc warm from previous baseline → realistic.
+        llama_memory_clear(llama_get_memory(lctx), false);
+        const double tb0 = lazyllm_now_ms();
+        const int rb = llama_decode(lctx, batch);
+        lctx->synchronize();
+        t_base_ms = lazyllm_now_ms() - tb0;
+        if (rb != 0) t_base_ms = 0.0;
+
+        // === LazyLLM measurement (steady-state) ===
+        // Untimed warm-up: cycles galloc through all lazyllm stages (Phase 1
+        // did this already, but the intervening baseline runs reset galloc to
+        // full-graph state).
+        llama_memory_clear(llama_get_memory(lctx), false);
+        ctx->kept_indices.clear();
+        ctx->last_scores.clear();
+        if (ctx->aux_cache_enabled) ctx->aux_cache.reset();
+        llama_lazyllm_prefill(ctx, batch);
+        lctx->synchronize();
+
+        // Timed lazyllm: galloc state from previous lazyllm (stage N) → first
+        // stage will incur realloc → matches what each benchmark rep sees.
+        llama_memory_clear(llama_get_memory(lctx), false);
+        ctx->kept_indices.clear();
+        ctx->last_scores.clear();
+        if (ctx->aux_cache_enabled) ctx->aux_cache.reset();
+        const double tl0 = lazyllm_now_ms();
+        const int rl = llama_lazyllm_prefill(ctx, batch);
+        lctx->synchronize();
+        t_lazy_ms = lazyllm_now_ms() - tl0;
+
+        ctx->warmup_baseline_ms = t_base_ms;
+        ctx->warmup_lazyllm_ms  = t_lazy_ms;
+
+        // Decision: enable fallback unless LazyLLM is meaningfully faster.
+        if (rl >= 0 && t_base_ms > 0.0 &&
+            t_lazy_ms * P.auto_fallback_min_speedup > t_base_ms) {
+            ctx->fallback_active = true;
+        } else {
+            ctx->fallback_active = false;
+        }
+
+        if (P.verbose) {
+            fprintf(stderr,
+                "[lazyllm] warmup: A/B baseline=%.1f ms lazyllm=%.1f ms speedup=%.2fx → %s\n",
+                t_base_ms, t_lazy_ms,
+                (t_lazy_ms > 0.0 ? t_base_ms / t_lazy_ms : 0.0),
+                ctx->fallback_active ? "FALLBACK to baseline" : "use LazyLLM");
+        }
+
+        // Final prime: leave galloc in the state that the chosen path expects,
+        // so the very first timed rep doesn't pay a realloc penalty.
+        //   • fallback active → run one untimed llama_decode (galloc full-graph)
+        //   • lazyllm active  → run stage 0 untimed (galloc stage 0)
+        llama_memory_clear(llama_get_memory(lctx), false);
+        if (ctx->fallback_active) {
+            llama_decode(lctx, batch);
+        } else {
+            const int l0 = P.pruning_layers[0];
+            lctx->decode_partial(batch, 0, l0, /*early_exit=*/false, /*no_embed_output=*/true);
+        }
+        lctx->synchronize();
     }
 
     // Reset context state so the warmup doesn't affect subsequent calls.

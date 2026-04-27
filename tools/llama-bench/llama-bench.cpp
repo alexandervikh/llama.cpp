@@ -2275,35 +2275,35 @@ static bool lazyllm_test_prompt(
     lp.pruning_layers = layers;
     lp.keep_ratios    = ratios;
     lp.verbose        = false;
+    // Auto-fallback ensures LazyLLM is never slower than baseline (e.g. on
+    // multi-GPU layer-split, short prompts, or any other unfavorable scenario).
+    lp.auto_fallback             = true;
+    lp.auto_fallback_min_speedup = 1.05f;
 
-    // Warmup: compile CUDA kernels and prime ggml allocator.
+    // Single lazyllm context shared across warmup + all reps so the fallback
+    // decision (fallback_active) made during warmup persists.
+    llama_lazyllm_context * lz = llama_lazyllm_init_with_params(ctx, lp);
+    if (!lz) {
+        fprintf(stderr, "%s: error: failed to init lazyllm context\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    // Warmup: compile CUDA kernels, prime ggml allocator, run A/B test.
     {
-        llama_lazyllm_context * lz = llama_lazyllm_init_with_params(ctx, lp);
-        if (!lz) {
-            fprintf(stderr, "%s: error: failed to init lazyllm context for warmup\n", __func__);
-            llama_free(ctx);
-            return false;
-        }
         llama_batch b = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
         llama_lazyllm_warmup(lz, b);
-        llama_lazyllm_free(lz);
     }
 
     for (int r = 0; r < reps; r++) {
         llama_memory_clear(llama_get_memory(ctx), false);
-
-        llama_lazyllm_context * lz = llama_lazyllm_init_with_params(ctx, lp);
-        if (!lz) {
-            fprintf(stderr, "%s: error: failed to init lazyllm context\n", __func__);
-            llama_free(ctx);
-            return false;
-        }
 
         // ── prefill (pp) ──────────────────────────────────────────────
         llama_batch b = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
 
         uint64_t t0 = get_time_ns();
         int n_kept = llama_lazyllm_prefill(lz, b);
+        llama_synchronize(ctx);
         uint64_t t1 = get_time_ns();
 
         if (n_kept < 0) {
@@ -2333,10 +2333,9 @@ static bool lazyllm_test_prompt(
             }
             samples_tg_ns.push_back(tg_total);
         }
-
-        llama_lazyllm_free(lz);
     }
 
+    llama_lazyllm_free(lz);
     llama_free(ctx);
     return true;
 }

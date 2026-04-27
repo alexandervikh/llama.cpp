@@ -37,6 +37,15 @@ struct llama_lazyllm_params {
     int   pool_kernel_size = 13;   // avg-pool window for score smoothing (1 = off)
     bool  verbose          = false;
 
+    // Auto-fallback to plain llama_decode when LazyLLM is not faster than baseline.
+    // During warmup, both strategies are timed on the warmup batch; if LazyLLM is
+    // not at least `auto_fallback_min_speedup` faster, the context's fallback
+    // flag is set and llama_lazyllm_prefill() transparently calls llama_decode.
+    // This ensures LazyLLM is never worse than baseline regardless of GPU split
+    // mode (none/layer/row), prompt length, or model size.
+    bool  auto_fallback             = true;
+    float auto_fallback_min_speedup = 1.05f;  // require ≥5% improvement to keep LazyLLM
+
     // Paper-recommended default schedule for Llama-2-7B (32 layers):
     llama_lazyllm_params() {
         pruning_layers = {8, 16, 24};
@@ -99,6 +108,13 @@ struct llama_lazyllm_context {
     int32_t                decode_step             = 0;   // how many decode steps done
     bool                   decode_pruning_enabled  = false;
     float                  decode_keep_ratio       = 0.7f; // fraction of old positions to keep per step
+
+    // Auto-fallback decision (set during llama_lazyllm_warmup).
+    // When true, llama_lazyllm_prefill() short-circuits to llama_decode()
+    // because the warmup A/B test showed LazyLLM was not faster than baseline.
+    bool                   fallback_active         = false;
+    double                 warmup_baseline_ms      = 0.0;  // diagnostic
+    double                 warmup_lazyllm_ms       = 0.0;  // diagnostic
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
