@@ -1541,6 +1541,22 @@ struct test {
 
     double stdev_ts() const { return ::stdev(get_ts()); }
 
+    // TTFT helpers — use samples_ttft_ns when available (prefill-only rows),
+    // otherwise fall back to samples_ns (which equals TTFT for pp-only tests).
+    std::vector<double> get_ttft_ms() const {
+        const auto & src = samples_ttft_ns.empty() ? samples_ns : samples_ttft_ns;
+        std::vector<double> ms;
+        ms.reserve(src.size());
+        for (uint64_t ns : src) {
+            ms.push_back(ns / 1e6);
+        }
+        return ms;
+    }
+
+    double avg_ttft_ms() const { return ::avg(get_ttft_ms()); }
+
+    double stdev_ttft_ms() const { return ::stdev(get_ttft_ms()); }
+
     static std::string get_backend() {
         std::vector<std::string> backends;
         bool                     rpc_used = false;
@@ -1827,6 +1843,9 @@ struct markdown_printer : public printer {
         if (field == "t/s") {
             return 20;
         }
+        if (field == "ttft") {
+            return 18;
+        }
         if (field == "size" || field == "params") {
             return 10;
         }
@@ -1918,6 +1937,9 @@ struct markdown_printer : public printer {
         if (field == "tensor_buft_overrides") {
             return "ot";
         }
+        if (field == "ttft") {
+            return "TTFT (ms)";
+        }
         return field;
     }
 
@@ -1998,6 +2020,11 @@ struct markdown_printer : public printer {
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
+        // Show TTFT column when any prompt is being tested.
+        if (!params.n_prompt.empty() &&
+            !(params.n_prompt.size() == 1 && params.n_prompt[0] == 0)) {
+            fields.emplace_back("ttft");
+        }
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
@@ -2053,6 +2080,14 @@ struct markdown_printer : public printer {
                 value = buf;
             } else if (field == "t/s") {
                 snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
+                value = buf;
+            } else if (field == "ttft") {
+                // Only meaningful for tests that have a prefill prompt.
+                if (t.n_prompt > 0 && !(t.samples_ttft_ns.empty() && t.samples_ns.empty())) {
+                    snprintf(buf, sizeof(buf), "%.0f ± %.0f", t.avg_ttft_ms(), t.stdev_ttft_ms());
+                } else {
+                    snprintf(buf, sizeof(buf), "-");
+                }
                 value = buf;
             } else if (vmap.find(field) != vmap.end()) {
                 value = vmap.at(field);
