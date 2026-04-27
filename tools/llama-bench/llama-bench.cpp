@@ -23,6 +23,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "llama-spec-prefill.h"
+#include "llama-lazyllm.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -354,6 +355,11 @@ struct cmd_params {
     std::vector<int>                 spec_n_lookahead;
     std::vector<int>                 spec_pool;
     std::vector<int>                 spec_chunk_size;
+
+    // LazyLLM options
+    bool                             lazyllm;           // enable LazyLLM prefill measurement
+    std::vector<int>                 lazyllm_layers;    // pruning layer indices (e.g. 8,16,24)
+    std::vector<float>               lazyllm_ratios;    // keep ratio per stage (e.g. 0.5,0.5,0.5)
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -398,6 +404,9 @@ static const cmd_params cmd_params_defaults = {
     /* spec_n_lookahead     */ { 8 },
     /* spec_pool            */ { 13 },
     /* spec_chunk_size      */ { 32 },
+    /* lazyllm              */ false,
+    /* lazyllm_layers       */ {},
+    /* lazyllm_ratios       */ { 0.5f, 0.5f, 0.5f },
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -484,6 +493,11 @@ static void print_usage(int /* argc */, char ** argv) {
            cmd_params_defaults.spec_pool[0]);
     printf("  --spec-chunk <n>                          chunk size (default: %d)\n",
            cmd_params_defaults.spec_chunk_size[0]);
+    printf("\n");
+    printf("LazyLLM prefill (measures pp speed-up vs baseline, no extra model required):\n");
+    printf("  --lazyllm                                 enable LazyLLM prefill measurement\n");
+    printf("  --lazyllm-layers <L1,L2,...>              pruning layer indices (default: auto 1/4,1/2,3/4 of model)\n");
+    printf("  --lazyllm-ratios <R1,R2,...>              keep ratio per stage (default: 0.5,0.5,0.5)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -862,6 +876,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.spec_chunk_size.insert(params.spec_chunk_size.end(), p.begin(), p.end());
+            } else if (arg == "--lazyllm") {
+                params.lazyllm = true;
+            } else if (arg == "--lazyllm-layers") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<int>(argv[i], ',');
+                params.lazyllm_layers.insert(params.lazyllm_layers.end(), p.begin(), p.end());
+            } else if (arg == "--lazyllm-ratios") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.lazyllm_ratios = string_split<float>(argv[i], ',');
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1152,6 +1181,9 @@ struct cmd_params_instance {
     int                spec_n_lookahead;
     int                spec_pool;
     int                spec_chunk_size;
+    bool               lazyllm;
+    std::vector<int>   lazyllm_layers;
+    std::vector<float> lazyllm_ratios;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1304,6 +1336,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .spec_n_lookahead   */ spec_lah,
                 /* .spec_pool          */ spec_pool,
                 /* .spec_chunk_size    */ spec_chunk,
+                /* .lazyllm            */ params.lazyllm,
+                /* .lazyllm_layers     */ params.lazyllm_layers,
+                /* .lazyllm_ratios     */ params.lazyllm_ratios,
             };
             instances.push_back(instance);
         }
@@ -1344,6 +1379,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .spec_n_lookahead   */ spec_lah,
                 /* .spec_pool          */ spec_pool,
                 /* .spec_chunk_size    */ spec_chunk,
+                /* .lazyllm            */ params.lazyllm,
+                /* .lazyllm_layers     */ params.lazyllm_layers,
+                /* .lazyllm_ratios     */ params.lazyllm_ratios,
             };
             instances.push_back(instance);
         }
@@ -1384,6 +1422,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .spec_n_lookahead   */ spec_lah,
                 /* .spec_pool          */ spec_pool,
                 /* .spec_chunk_size    */ spec_chunk,
+                /* .lazyllm            */ params.lazyllm,
+                /* .lazyllm_layers     */ params.lazyllm_layers,
+                /* .lazyllm_ratios     */ params.lazyllm_ratios,
             };
             instances.push_back(instance);
         }
@@ -1434,6 +1475,8 @@ struct test {
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
     std::vector<uint64_t>    samples_ttft_ns;
+    bool                     is_lazyllm    = false;  // set true for lazyllm rows
+    std::vector<float>       lazyllm_ratios;          // keep ratios for display
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1995,12 +2038,13 @@ struct markdown_printer : public printer {
             } else if (field == "backend") {
                 value = test::get_backend();
             } else if (field == "test") {
+                const char * pfx = t.is_lazyllm ? "lz-" : "";
                 if (t.n_prompt > 0 && t.n_gen == 0) {
-                    snprintf(buf, sizeof(buf), "pp%d", t.n_prompt);
+                    snprintf(buf, sizeof(buf), "%spp%d", pfx, t.n_prompt);
                 } else if (t.n_gen > 0 && t.n_prompt == 0) {
-                    snprintf(buf, sizeof(buf), "tg%d", t.n_gen);
+                    snprintf(buf, sizeof(buf), "%stg%d", pfx, t.n_gen);
                 } else {
-                    snprintf(buf, sizeof(buf), "pp%d+tg%d", t.n_prompt, t.n_gen);
+                    snprintf(buf, sizeof(buf), "%spp%d+tg%d", pfx, t.n_prompt, t.n_gen);
                 }
                 if (t.n_depth > 0) {
                     int len = strlen(buf);
@@ -2184,6 +2228,117 @@ static bool spec_prefill_test_prompt(
 
     llama_spec_prefill_free(spec_ctx);
     return ok;
+}
+
+// Returns pruning layers auto-derived from model depth: 1/4, 1/2, 3/4 of n_layer.
+static std::vector<int> lazyllm_default_layers(const llama_model * model) {
+    int n_layer = llama_model_n_layer(model);
+    return { n_layer / 4, n_layer / 2, (n_layer * 3) / 4 };
+}
+
+// Measures LazyLLM prefill (pp) and optionally generation (tg) speed.
+// Creates a fresh context with n_batch >= n_prompt (required by lazyllm_prefill).
+// Appends pp timing to samples_pp_ns and, if n_gen > 0, tg timing to samples_tg_ns.
+static bool lazyllm_test_prompt(
+    llama_model                 * lmodel,
+    const cmd_params_instance   & inst,
+    int                           n_prompt,
+    int                           n_gen,
+    const std::vector<int>      & layers,
+    const std::vector<float>    & ratios,
+    std::vector<uint64_t>       & samples_pp_ns,
+    std::vector<uint64_t>       & samples_tg_ns,
+    int                           reps) {
+
+    // LazyLLM prefill requires the entire prompt in a single llama_decode call.
+    // Create a fresh context with n_batch >= n_prompt.
+    llama_context_params lz_cparams = inst.to_llama_cparams();
+    lz_cparams.n_batch  = (uint32_t)std::max((int)lz_cparams.n_batch, n_prompt);
+    lz_cparams.n_ubatch = (uint32_t)std::min((int)lz_cparams.n_batch, (int)lz_cparams.n_ubatch);
+
+    llama_context * ctx = llama_init_from_model(lmodel, lz_cparams);
+    if (!ctx) {
+        fprintf(stderr, "%s: error: failed to create lazyllm context\n", __func__);
+        return false;
+    }
+
+    const llama_vocab * vocab   = llama_model_get_vocab(lmodel);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> tokens(n_prompt);
+    tokens[0] = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    for (int i = 1; i < n_prompt; i++) {
+        tokens[i] = std::rand() % n_vocab;
+    }
+
+    llama_lazyllm_params lp;
+    lp.pruning_layers = layers;
+    lp.keep_ratios    = ratios;
+    lp.verbose        = false;
+
+    // Warmup: compile CUDA kernels and prime ggml allocator.
+    {
+        llama_lazyllm_context * lz = llama_lazyllm_init_with_params(ctx, lp);
+        if (!lz) {
+            fprintf(stderr, "%s: error: failed to init lazyllm context for warmup\n", __func__);
+            llama_free(ctx);
+            return false;
+        }
+        llama_batch b = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+        llama_lazyllm_warmup(lz, b);
+        llama_lazyllm_free(lz);
+    }
+
+    for (int r = 0; r < reps; r++) {
+        llama_memory_clear(llama_get_memory(ctx), false);
+
+        llama_lazyllm_context * lz = llama_lazyllm_init_with_params(ctx, lp);
+        if (!lz) {
+            fprintf(stderr, "%s: error: failed to init lazyllm context\n", __func__);
+            llama_free(ctx);
+            return false;
+        }
+
+        // ── prefill (pp) ──────────────────────────────────────────────
+        llama_batch b = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+
+        uint64_t t0 = get_time_ns();
+        int n_kept = llama_lazyllm_prefill(lz, b);
+        uint64_t t1 = get_time_ns();
+
+        if (n_kept < 0) {
+            fprintf(stderr, "%s: error: lazyllm prefill failed\n", __func__);
+            llama_lazyllm_free(lz);
+            llama_free(ctx);
+            return false;
+        }
+        samples_pp_ns.push_back(t1 - t0);
+
+        // ── generation (tg) ───────────────────────────────────────────
+        if (n_gen > 0) {
+            llama_token tok = std::rand() % n_vocab;
+            uint64_t tg_total = 0;
+            for (int i = 0; i < n_gen; i++) {
+                uint64_t ts0 = get_time_ns();
+                int res = llama_decode(ctx, llama_batch_get_one(&tok, 1));
+                if (res != 0) {
+                    fprintf(stderr, "%s: error: decode step %d failed\n", __func__, i);
+                    llama_lazyllm_free(lz);
+                    llama_free(ctx);
+                    return false;
+                }
+                llama_synchronize(ctx);
+                tg_total += get_time_ns() - ts0;
+                tok = std::rand() % n_vocab;
+            }
+            samples_tg_ns.push_back(tg_total);
+        }
+
+        llama_lazyllm_free(lz);
+    }
+
+    llama_free(ctx);
+    return true;
 }
 
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
@@ -2518,6 +2673,66 @@ int main(int argc, char ** argv) {
         if (p_err) {
             p_err->print_test(t);
             fflush(p_err->fout);
+        }
+
+        // ── LazyLLM measurement (runs after baseline, uses same ctx) ──────────
+        // Only relevant when there is a prefill prompt (LazyLLM optimizes prefill).
+        if (inst.lazyllm && t.spec_model.empty() && t.n_prompt > 0) {
+            std::vector<int> lz_layers = inst.lazyllm_layers;
+            if (lz_layers.empty()) {
+                lz_layers = lazyllm_default_layers(lmodel);
+            }
+            std::vector<float> lz_ratios = inst.lazyllm_ratios;
+            while (lz_ratios.size() < lz_layers.size()) { lz_ratios.push_back(0.5f); }
+            lz_ratios.resize(lz_layers.size());
+
+            if (params.progress) {
+                fprintf(stderr, "llama-bench: lazyllm benchmark (pp=%d tg=%d layers=%d ratios=[",
+                        t.n_prompt, t.n_gen, (int)lz_layers.size());
+                for (size_t li = 0; li < lz_ratios.size(); li++) {
+                    fprintf(stderr, "%.2f%s", lz_ratios[li], li + 1 < lz_ratios.size() ? "," : "");
+                }
+                fprintf(stderr, "])\n");
+            }
+
+            test t_lz = t;
+            t_lz.is_lazyllm     = true;
+            t_lz.lazyllm_ratios = lz_ratios;
+            t_lz.samples_ns.clear();
+            t_lz.samples_ttft_ns.clear();
+
+            std::vector<uint64_t> lz_pp_ns, lz_tg_ns;
+            bool lz_ok = lazyllm_test_prompt(
+                lmodel, inst, t.n_prompt, t.n_gen,
+                lz_layers, lz_ratios,
+                lz_pp_ns, lz_tg_ns, params.reps);
+
+            if (lz_ok) {
+                if (t.n_prompt > 0 && t.n_gen == 0) {
+                    // pp-only: report pp throughput (same n_prompt denominator for fair comparison)
+                    t_lz.samples_ns = lz_pp_ns;
+                } else if (t.n_gen > 0 && t.n_prompt == 0) {
+                    // tg-only: report tg throughput
+                    t_lz.samples_ns = lz_tg_ns;
+                } else {
+                    // pp+tg combined
+                    size_t n = std::min(lz_pp_ns.size(), lz_tg_ns.size());
+                    for (size_t i = 0; i < n; i++) {
+                        t_lz.samples_ns.push_back(lz_pp_ns[i] + lz_tg_ns[i]);
+                    }
+                    t_lz.samples_ttft_ns = lz_pp_ns;
+                }
+                if (p) {
+                    p->print_test(t_lz);
+                    fflush(p->fout);
+                }
+                if (p_err) {
+                    p_err->print_test(t_lz);
+                    fflush(p_err->fout);
+                }
+            } else {
+                fprintf(stderr, "%s: warning: lazyllm benchmark failed, skipping row\n", __func__);
+            }
         }
 
         llama_perf_context_print(ctx);
