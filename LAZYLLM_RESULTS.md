@@ -31,15 +31,12 @@
 
 ---
 
-## Prior Benchmark (2026-04-27) — Llama-3.1-8B-Instruct Q8_0, multiple configs
+## Prior Benchmark (2026-04-27) — Q8_0 models, multiple configs
 
 Dataset: HotpotQA subset from LongBench (real prompts truncated to n_ctx).  
 Pruning layers set at ¼, ½, ¾ model depth (3-stage).
 
 ## TTFT Speedup
-
-Dataset: HotpotQA subset from LongBench (real prompts truncated to n_ctx).  
-Pruning layers set at ¼, ½, ¾ model depth (3-stage).
 
 | Model | Ctx | Keep Ratio | Baseline TTFT | LazyLLM TTFT | Speedup | Note |
 |-------|-----|------------|--------------|-------------|---------|------|
