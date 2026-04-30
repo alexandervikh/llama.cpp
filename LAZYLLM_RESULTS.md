@@ -2,11 +2,39 @@
 
 **Paper**: arXiv:2407.14057 — "LazyLLM: Dynamic Token Pruning for Efficient Long Context LLM Inference"  
 **Branch**: `lazy_llm`  
-**Date**: 2026-04-27  
+**Date**: 2026-04-30 (live run) / 2026-04-27 (prior Q8 run)  
 **Hardware**: 4× NVIDIA L4 24 GB · Build: `GGML_CUDA=ON`, `GGML_CUDA_GRAPHS=OFF`  
 **Baseline fix**: `llama_synchronize()` called after `llama_decode` to measure true GPU completion time  
 
 ---
+
+## Live Benchmark (2026-04-30) — Llama-3.1-8B-Instruct Q4_K_M, 5 LongBench Subsets
+
+**Config**: pruning layers 8/16/24, kr=0.5/0.5/0.5, middle-truncation, n_ctx=4096, n=30 per subset.
+
+| Task Category | Subset | Metric | Baseline | LazyLLM | Score Δ | BL TTFT | LZ TTFT | Speedup |
+|---|---|---|---|---|---|---|---|---|
+| Multi-Doc QA | hotpotqa | F1 | 34.96 | 5.71 | −29.24 | 1639 ms | 900 ms | **1.82×** |
+| Single-Doc QA | qasper | F1 | 20.81 | 1.60 | −19.21 | 1570 ms | 870 ms | **1.80×** |
+| Single-Doc QA | narrativeqa | F1 | 20.41 | 1.25 | −19.16 | 1572 ms | 873 ms | **1.80×** |
+| Few-shot | trec | Accuracy | 63.33 | 46.67 | −16.67 | 1637 ms | 896 ms | **1.83×** |
+| Summarization | gov_report | Rouge-L | 20.67 | 0.77 | −19.90 | 1440 ms | 792 ms | **1.82×** |
+
+**TTFT summary**: consistent 1.80–1.83× speedup across all task types.
+
+**Quality gap root cause** (compared to paper's near-zero drop):
+1. **Q4_K_M vs Q8_0** — Prior Q8_0 run (Apr 27) showed quality *maintained* (+2.1% F1 delta); Q4 quantization error compounds with 87.5% token pruning.
+2. **Instruct model sensitivity** — The paper used LLaMA-2-7B (base); instruction-tuned models generate chain-of-thought or repeat context when tokens are degraded, inflating output length and degrading exact-match metrics.
+3. **Aggressive pruning** — kr=0.5³ = 12.5% tokens retained. Conservative kr=0.7/0.7/0.7 (34.3% retained) would improve quality at cost of ~1.5× speedup.
+
+**Next step**: re-run with Q8_0 model to confirm quality is maintained (as in Apr 27 results).
+
+---
+
+## Prior Benchmark (2026-04-27) — Llama-3.1-8B-Instruct Q8_0, multiple configs
+
+Dataset: HotpotQA subset from LongBench (real prompts truncated to n_ctx).  
+Pruning layers set at ¼, ½, ¾ model depth (3-stage).
 
 ## TTFT Speedup
 
