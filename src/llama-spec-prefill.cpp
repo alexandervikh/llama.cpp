@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 
 llama_spec_prefill_context * llama_spec_prefill_init(
@@ -442,6 +443,59 @@ int llama_spec_prefill_compute_importance(
 
     token_importance.resize(n_prompt, 0.0f);
 
+    // Prefer lookahead entropy scores first: generate_lookahead() already ran the full prompt on the
+    // speculator and recorded per-step entropy — using that avoids a second full spec-model decode for
+    // perplexity (which dominated short-/medium-context latency vs the paper's cheaper attention proxy).
+    // Optional perplexity refinement: set LLAMA_SPEC_PREFILL_PERPLEXITY=1 to force the legacy path for n_prompt<=4096.
+    const char * ev_perp = getenv("LLAMA_SPEC_PREFILL_PERPLEXITY");
+    const bool force_perplexity = ev_perp && ev_perp[0] != '\0' && std::strcmp(ev_perp, "0") != 0;
+
+    auto compute_entropy_importance = [&]() -> bool {
+        if (ctx->lookahead_stats.empty()) {
+            return false;
+        }
+        float max_entropy = 1e-6f;
+        for (const auto & stat : ctx->lookahead_stats) {
+            if (stat.entropy > max_entropy) {
+                max_entropy = stat.entropy;
+            }
+        }
+        for (int i = 0; i < n_prompt; i++) {
+            float importance = 0.0f;
+            for (const auto & stat : ctx->lookahead_stats) {
+                const int distance = stat.position - i;
+                if (distance > 0) {
+                    const float confidence = 1.0f - (stat.entropy / max_entropy);
+                    importance += confidence / (1.0f + sqrtf((float)distance));
+                }
+            }
+            token_importance[i] = 0.1f + 0.9f * importance;
+        }
+        float min_imp = token_importance[0], max_imp = token_importance[0];
+        for (int i = 1; i < n_prompt; i++) {
+            if (token_importance[i] < min_imp) {
+                min_imp = token_importance[i];
+            }
+            if (token_importance[i] > max_imp) {
+                max_imp = token_importance[i];
+            }
+        }
+        const float range = max_imp - min_imp;
+        if (range > 1e-6f) {
+            for (int i = 0; i < n_prompt; i++) {
+                token_importance[i] = 0.1f + 0.9f * (token_importance[i] - min_imp) / range;
+            }
+        }
+        if (ctx->params.pool_kernel_size > 1) {
+            llama_spec_prefill_apply_pooling(token_importance, ctx->params.pool_kernel_size);
+        }
+        return true;
+    };
+
+    if (!force_perplexity && compute_entropy_importance()) {
+        return 0;
+    }
+
     // Perplexity-based scoring: importance[i+1] = -log P(token[i+1] | context[0..i])
     // Processed in chunks of CHUNK_SIZE to match the n_ubatch=512 graph reservation.
     // Logits are read immediately after each chunk before the next chunk overwrites the buffer.
@@ -520,42 +574,14 @@ int llama_spec_prefill_compute_importance(
         llama_memory_clear(llama_get_memory(ctx->ctx_spec), false);
     }
 
-    // --- Entropy proxy fallback (long prompts or decode failure) ---
-    if (ctx->lookahead_stats.empty()) {
-        for (int i = 0; i < n_prompt; i++)
-            token_importance[i] = 0.1f + 0.9f * (float)i / (n_prompt - 1);
+    // --- Entropy proxy fallback (long prompts, decode failure, or empty lookahead stats) ---
+    if (compute_entropy_importance()) {
         return 0;
     }
 
-    float max_entropy = 1e-6f;
-    for (const auto & stat : ctx->lookahead_stats)
-        if (stat.entropy > max_entropy) max_entropy = stat.entropy;
-
     for (int i = 0; i < n_prompt; i++) {
-        float importance = 0.0f;
-        for (const auto & stat : ctx->lookahead_stats) {
-            int distance = stat.position - i;
-            if (distance > 0) {
-                float confidence = 1.0f - (stat.entropy / max_entropy);
-                importance += confidence / (1.0f + sqrtf((float)distance));
-            }
-        }
-        token_importance[i] = 0.1f + 0.9f * importance;
+        token_importance[i] = 0.1f + 0.9f * (float)i / (std::max(1, n_prompt - 1));
     }
-
-    float min_imp = token_importance[0], max_imp = token_importance[0];
-    for (int i = 1; i < n_prompt; i++) {
-        if (token_importance[i] < min_imp) min_imp = token_importance[i];
-        if (token_importance[i] > max_imp) max_imp = token_importance[i];
-    }
-    float range = max_imp - min_imp;
-    if (range > 1e-6f)
-        for (int i = 0; i < n_prompt; i++)
-            token_importance[i] = 0.1f + 0.9f * (token_importance[i] - min_imp) / range;
-
-    if (ctx->params.pool_kernel_size > 1)
-        llama_spec_prefill_apply_pooling(token_importance, ctx->params.pool_kernel_size);
-
     return 0;
 }
 

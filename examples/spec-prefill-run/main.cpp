@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "llama-spec-prefill.h"
+#include "ggml-backend.h"
 #include <vector>
 #include <string>
 #include <iostream>
@@ -8,6 +9,8 @@
 #include <iomanip>
 #include <cmath>
 #include <algorithm>
+#include <sstream>
+#include <cctype>
 
 struct Args {
     std::string model_path;
@@ -20,13 +23,52 @@ struct Args {
     std::string out_file;
     uint32_t n_ctx = 0;
     uint32_t n_batch = 0;
+    /// Layers to offload to GPU for base and spec models (0 = CPU-only; use a large value e.g. 99 for full offload).
+    int32_t n_gpu_layers = 0;
+    /// Comma-separated tensor split (per-GPU weights), e.g. `0.25,0.25,0.25,0.25` for 4 GPUs. Empty = default (single GPU).
+    std::string tensor_split_str;
+    /// If true, `split_mode` was set explicitly via `--split-mode` / `-sm`.
+    bool split_mode_set = false;
+    llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER;
+    /// -1 = use llama default; else `main_gpu` for model params.
+    int32_t main_gpu = -1;
 };
+
+static std::string trim_str(const std::string & s) {
+    size_t a = 0;
+    while (a < s.size() && std::isspace((unsigned char) s[a])) {
+        a++;
+    }
+    size_t b = s.size();
+    while (b > a && std::isspace((unsigned char) s[b - 1])) {
+        b--;
+    }
+    return s.substr(a, b - a);
+}
+
+static bool parse_tensor_split_str(const std::string & csv, std::vector<float> & out) {
+    out.assign(llama_max_devices(), 0.f);
+    size_t n = 0;
+    std::stringstream ss(csv);
+    std::string item;
+    while (std::getline(ss, item, ',') && n < out.size()) {
+        item = trim_str(item);
+        if (item.empty()) {
+            continue;
+        }
+        out[n++] = std::stof(item);
+    }
+    return n > 0;
+}
 
 static void print_usage() {
     std::cout << "Usage: llama-spec-prefill-run "
               << "--model <path> --spec-model <path> --prompt-file <path> --out <path> "
               << "[--keep-ratio <ratio>] [--lookahead <n>] [--pool <n>] [--chunk-size <n>] "
-              << "[--n-ctx <n>] [--n-batch <n>]\n";
+              << "[--n-ctx <n>] [--n-batch <n>] "
+              << "[-ngl N | --gpu-layers N] "
+              << "[-ts <n0,n1,...> | --tensor-split <...>] [-sm <none|layer|row> | --split-mode <...>] "
+              << "[-mg <i> | --main-gpu <i>]\n";
 }
 
 static std::string greedy_decode(llama_context * ctx, const llama_vocab * vocab, int n_tokens_max) {
@@ -68,7 +110,26 @@ int main(int argc, char ** argv) {
         else if (arg == "--out" && i + 1 < argc) args.out_file = argv[++i];
         else if (arg == "--n-ctx" && i + 1 < argc) args.n_ctx = (uint32_t)std::stoul(argv[++i]);
         else if (arg == "--n-batch" && i + 1 < argc) args.n_batch = (uint32_t)std::stoul(argv[++i]);
-        else {
+        else if ((arg == "-ngl" || arg == "--gpu-layers") && i + 1 < argc) {
+            args.n_gpu_layers = (int32_t) std::stol(argv[++i]);
+        } else if ((arg == "-ts" || arg == "--tensor-split") && i + 1 < argc) {
+            args.tensor_split_str = argv[++i];
+        } else if ((arg == "-sm" || arg == "--split-mode") && i + 1 < argc) {
+            args.split_mode_set = true;
+            std::string v = argv[++i];
+            if (v == "none") {
+                args.split_mode = LLAMA_SPLIT_MODE_NONE;
+            } else if (v == "layer") {
+                args.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            } else if (v == "row") {
+                args.split_mode = LLAMA_SPLIT_MODE_ROW;
+            } else {
+                print_usage();
+                return 1;
+            }
+        } else if ((arg == "-mg" || arg == "--main-gpu") && i + 1 < argc) {
+            args.main_gpu = (int32_t) std::stol(argv[++i]);
+        } else {
             print_usage();
             return 1;
         }
@@ -79,7 +140,26 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    ggml_backend_load_all();
+
     llama_model_params model_params = llama_model_default_params();
+    if (args.n_gpu_layers > 0) {
+        model_params.n_gpu_layers = args.n_gpu_layers;
+    }
+    std::vector<float> tensor_split_buf;
+    if (!args.tensor_split_str.empty()) {
+        if (!parse_tensor_split_str(args.tensor_split_str, tensor_split_buf)) {
+            std::cerr << "error: failed to parse --tensor-split (need comma-separated floats)\n";
+            return 1;
+        }
+        model_params.tensor_split = tensor_split_buf.data();
+        model_params.split_mode = args.split_mode_set ? args.split_mode : LLAMA_SPLIT_MODE_LAYER;
+    } else if (args.split_mode_set) {
+        model_params.split_mode = args.split_mode;
+    }
+    if (args.main_gpu >= 0) {
+        model_params.main_gpu = args.main_gpu;
+    }
     llama_model * model_base = llama_model_load_from_file(args.model_path.c_str(), model_params);
     llama_model * model_spec = llama_model_load_from_file(args.spec_model_path.c_str(), model_params);
 

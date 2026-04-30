@@ -211,6 +211,57 @@ static std::string devices_to_string(const std::vector<ggml_backend_dev_t> & dev
     return join(names, "/");
 }
 
+static std::string gguf_basename(const std::string & path) {
+    if (path.empty()) {
+        return "";
+    }
+    const size_t p = path.find_last_of("/\\");
+    return (p != std::string::npos && p + 1 < path.size()) ? path.substr(p + 1) : path;
+}
+
+/// Cited TTFT speedup figures from Liu, Chen & Zhang, "Speculative Prefill…", arXiv:2502.02789
+/// (see SPEC_PREFILL_PAPER_COMPARE.md). vLLM / 70B–405B settings — not row-aligned with llama.cpp.
+static void paper_ref_ttft_speedup_lookup(float kr, int n_prompt, std::string & ref_val, std::string & cite) {
+    ref_val.clear();
+    cite.clear();
+    (void) n_prompt;
+
+    if (kr >= 0.995f) {
+        ref_val = "1.00";
+        cite    = "dense baseline / identity (Fig.6 short-ctx note)";
+        return;
+    }
+    // Fig. 3 caption / §4.7.2: ~10% tokens kept ≈ kr 0.10 here; peak TTFT vs dense up to 7.66× on 405B-FP8.
+    if (kr >= 0.08f && kr <= 0.12f) {
+        ref_val = "≤7.66";
+        cite    = "Fig.3 §4.7.2 peak vs dense (405B-Instruct-FP8 ~10% tokens)";
+        return;
+    }
+    // Fig. 5: TTFT vs MInference span for Llama-3.1-70B (paper stack).
+    if (kr >= 0.22f && kr <= 0.28f) {
+        ref_val = "2.54–6.54";
+        cite    = "Fig.5 TTFT vs MInference (70B)";
+        return;
+    }
+
+    ref_val = "—";
+    cite    = "no headline figure for this kr (see arXiv:2502.02789)";
+}
+
+/// Paper-reported S× for side-by-side columns: single scalars or "lo-hi" span; "-" if none.
+static std::string paper_Sx_compare_value(float kr) {
+    if (kr >= 0.995f) {
+        return "1.00";
+    }
+    if (kr >= 0.08f && kr <= 0.12f) {
+        return "7.66";
+    }
+    if (kr >= 0.22f && kr <= 0.28f) {
+        return "2.54–6.54";
+    }
+    return "-";
+}
+
 // command line params
 enum output_formats { NONE, CSV, JSON, JSONL, MARKDOWN, SQL };
 
@@ -345,6 +396,7 @@ struct cmd_params {
     ggml_sched_priority              prio;
     int                              delay;
     bool                             verbose;
+    bool                             markdown_show_all;
     bool                             progress;
     bool                             no_warmup;
     output_formats                   output_format;
@@ -390,6 +442,7 @@ static const cmd_params cmd_params_defaults = {
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
     /* delay                */ 0,
     /* verbose              */ false,
+    /* markdown_show_all    */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
@@ -418,6 +471,7 @@ static void print_usage(int /* argc */, char ** argv) {
            output_format_str(cmd_params_defaults.output_format_stderr));
     printf("  --list-devices                            list available devices and exit\n");
     printf("  -v, --verbose                             verbose output\n");
+    printf("  --markdown-show-all                       markdown: print all columns (not only those that vary)\n");
     printf("  --progress                                print test progress indicators\n");
     printf("  --no-warmup                               skip warmup runs before benchmarking\n");
     if (llama_supports_rpc()) {
@@ -474,7 +528,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --no-host <0|1>                           (default: %s)\n",
            join(cmd_params_defaults.no_host, ",").c_str());
     printf("\n");
-    printf("speculative prefill (optional, measured alongside baseline):\n");
+    printf("speculative prefill (optional; use prompt-only mode, i.e. -n 0, for a spec-prefill sweep):\n");
     printf("  -m2, --spec-model <filename>              speculative prefill model (default: none)\n");
     printf("  --spec-kr <ratio>                         keep ratio (0.0-1.0, default: %.2f)\n",
            cmd_params_defaults.spec_keep_ratio[0]);
@@ -484,6 +538,8 @@ static void print_usage(int /* argc */, char ** argv) {
            cmd_params_defaults.spec_pool[0]);
     printf("  --spec-chunk <n>                          chunk size (default: %d)\n",
            cmd_params_defaults.spec_chunk_size[0]);
+    printf("  (with -m2: meas_ttft_Sx = dense pp / full spec-prefill pipeline per rep (end-to-end);\n");
+    printf("   paper_ref_* = cited headline numbers from arXiv:2502.02789 for side-by-side comparison)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -528,6 +584,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     const char        split_delim   = ',';
 
     params.verbose              = cmd_params_defaults.verbose;
+    params.markdown_show_all    = cmd_params_defaults.markdown_show_all;
     params.output_format        = cmd_params_defaults.output_format;
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps                 = cmd_params_defaults.reps;
@@ -998,6 +1055,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = !output_format_from_str(argv[i], params.output_format_stderr);
             } else if (arg == "-v" || arg == "--verbose") {
                 params.verbose = true;
+            } else if (arg == "--markdown-show-all") {
+                params.markdown_show_all = true;
             } else if (arg == "--progress") {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
@@ -1390,6 +1449,29 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     }
     // clang-format on
 
+    std::sort(instances.begin(), instances.end(), [](const cmd_params_instance & a, const cmd_params_instance & b) {
+        if (a.n_prompt != b.n_prompt) {
+            return a.n_prompt < b.n_prompt;
+        }
+        if (a.n_gen != b.n_gen) {
+            return a.n_gen < b.n_gen;
+        }
+        // Descending kr so spec-prefill sweeps print from dense-like (kr≈1) down to small kr
+        if (a.spec_keep_ratio != b.spec_keep_ratio) {
+            return a.spec_keep_ratio > b.spec_keep_ratio;
+        }
+        if (a.n_depth != b.n_depth) {
+            return a.n_depth < b.n_depth;
+        }
+        if (a.model != b.model) {
+            return a.model < b.model;
+        }
+        if (a.spec_model != b.spec_model) {
+            return a.spec_model < b.spec_model;
+        }
+        return false;
+    });
+
     return instances;
 }
 
@@ -1434,6 +1516,8 @@ struct test {
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
     std::vector<uint64_t>    samples_ttft_ns;
+    /// Dense full-prompt prefill time / full spec-prefill pipeline time (paper-like end-to-end).
+    std::vector<double> samples_meas_ttft_Sx;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1498,6 +1582,20 @@ struct test {
 
     double stdev_ts() const { return ::stdev(get_ts()); }
 
+    double avg_meas_ttft_Sx() const {
+        if (samples_meas_ttft_Sx.empty()) {
+            return 0;
+        }
+        return ::avg(samples_meas_ttft_Sx);
+    }
+
+    double stdev_meas_ttft_Sx() const {
+        if (samples_meas_ttft_Sx.empty()) {
+            return 0;
+        }
+        return ::stdev(samples_meas_ttft_Sx);
+    }
+
     static std::string get_backend() {
         std::vector<std::string> backends;
         bool                     rpc_used = false;
@@ -1523,14 +1621,15 @@ struct test {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
-            "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
+            "model_filename", "main_model",     "draft_model",   "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "spec_model",    "spec_keep_ratio","spec_n_lookahead",
             "n_prompt",       "n_gen",           "n_depth",       "test_time",      "avg_ns",
-            "stddev_ns",      "avg_ts",          "stddev_ts",      "spec_n_kept"
+            "stddev_ns",      "avg_ts",          "stddev_ts",      "spec_n_kept",
+            "meas_ttft_Sx",   "paper_ref_Sx",    "paper_ref_src",  "paper_Sx"
         };
         return fields;
     }
@@ -1548,12 +1647,15 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
-            field == "spec_keep_ratio") {
+            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "spec_keep_ratio") {
             return FLOAT;
+        }
+        if (field == "meas_ttft_Sx" || field == "paper_ref_Sx" || field == "paper_ref_src" ||
+            field == "paper_Sx" || field == "main_model" || field == "draft_model") {
+            return STRING;
         }
         return STRING;
     }
@@ -1595,12 +1697,26 @@ struct test {
                 }
             }
         }
+        std::string meas_ttft_str = "-";
+        if (!samples_meas_ttft_Sx.empty()) {
+            char pb[64];
+            snprintf(pb, sizeof(pb), "%.2f ± %.2f", avg_meas_ttft_Sx(), stdev_meas_ttft_Sx());
+            meas_ttft_str = pb;
+        }
+        std::string paper_ref_Sx_str  = "-";
+        std::string paper_ref_src_str = "-";
+        if (!spec_model.empty()) {
+            paper_ref_ttft_speedup_lookup(spec_keep_ratio, n_prompt, paper_ref_Sx_str, paper_ref_src_str);
+        }
+        const std::string paper_Sx_str = spec_model.empty() ? std::string("-") : paper_Sx_compare_value(spec_keep_ratio);
         std::vector<std::string> values = { build_commit,
                                             std::to_string(build_number),
                                             cpu_info,
                                             gpu_info,
                                             get_backend(),
                                             model_filename,
+                                            gguf_basename(model_filename),
+                                            spec_model.empty() ? std::string("-") : gguf_basename(spec_model),
                                             model_type,
                                             std::to_string(model_size),
                                             std::to_string(model_n_params),
@@ -1637,7 +1753,11 @@ struct test {
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
                                             std::to_string(stdev_ts()),
-                                            std::to_string(spec_n_kept) };
+                                            std::to_string(spec_n_kept),
+                                            meas_ttft_str,
+                                            paper_ref_Sx_str,
+                                            paper_ref_src_str,
+                                            paper_Sx_str };
         return values;
     }
 
@@ -1820,6 +1940,33 @@ struct markdown_printer : public printer {
         if (field == "test") {
             return 15;
         }
+        if (field == "spec_keep_ratio") {
+            return 6;
+        }
+        if (field == "spec_n_lookahead") {
+            return 3;
+        }
+        if (field == "spec_n_kept") {
+            return 8;
+        }
+        if (field == "meas_ttft_Sx") {
+            return 14;
+        }
+        if (field == "paper_ref_Sx") {
+            return 12;
+        }
+        if (field == "paper_Sx") {
+            return 10;
+        }
+        if (field == "paper_ref_src") {
+            return -44;
+        }
+        if (field == "spec_model") {
+            return -22;
+        }
+        if (field == "main_model" || field == "draft_model") {
+            return -26;
+        }
         if (field == "no_op_offload") {
             return 4;
         }
@@ -1869,6 +2016,36 @@ struct markdown_printer : public printer {
         if (field == "devices") {
             return "dev";
         }
+        if (field == "spec_model") {
+            return "spec path";
+        }
+        if (field == "main_model") {
+            return "main";
+        }
+        if (field == "draft_model") {
+            return "draft";
+        }
+        if (field == "spec_keep_ratio") {
+            return "kr";
+        }
+        if (field == "spec_n_lookahead") {
+            return "lah";
+        }
+        if (field == "spec_n_kept") {
+            return "kept";
+        }
+        if (field == "meas_ttft_Sx") {
+            return "ours S×";
+        }
+        if (field == "paper_ref_Sx") {
+            return "paper ref";
+        }
+        if (field == "paper_Sx") {
+            return "Sx(paper)";
+        }
+        if (field == "paper_ref_src") {
+            return "arxiv cite";
+        }
         if (field == "tensor_split") {
             return "ts";
         }
@@ -1879,7 +2056,8 @@ struct markdown_printer : public printer {
     }
 
     void print_header(const cmd_params & params) override {
-        // select fields to print
+        // select fields to print (--markdown-show-all: include every optional column)
+        const bool ma = params.markdown_show_all;
         fields.emplace_back("model");
         fields.emplace_back("size");
         fields.emplace_back("params");
@@ -1887,74 +2065,85 @@ struct markdown_printer : public printer {
         bool is_cpu_backend = test::get_backend().find("CPU") != std::string::npos ||
                               test::get_backend().find("BLAS") != std::string::npos ||
                               test::get_backend().find("ZenDNN") != std::string::npos;
-        if (!is_cpu_backend) {
+        if (ma || !is_cpu_backend) {
             fields.emplace_back("n_gpu_layers");
         }
-        if (params.n_cpu_moe.size() > 1) {
+        if (ma || params.n_cpu_moe.size() > 1) {
             fields.emplace_back("n_cpu_moe");
         }
-        if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
+        if (ma || params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");
         }
-        if (params.cpu_mask.size() > 1 || params.cpu_mask != cmd_params_defaults.cpu_mask) {
+        if (ma || params.cpu_mask.size() > 1 || params.cpu_mask != cmd_params_defaults.cpu_mask) {
             fields.emplace_back("cpu_mask");
         }
-        if (params.cpu_strict.size() > 1 || params.cpu_strict != cmd_params_defaults.cpu_strict) {
+        if (ma || params.cpu_strict.size() > 1 || params.cpu_strict != cmd_params_defaults.cpu_strict) {
             fields.emplace_back("cpu_strict");
         }
-        if (params.poll.size() > 1 || params.poll != cmd_params_defaults.poll) {
+        if (ma || params.poll.size() > 1 || params.poll != cmd_params_defaults.poll) {
             fields.emplace_back("poll");
         }
-        if (params.n_batch.size() > 1 || params.n_batch != cmd_params_defaults.n_batch) {
+        if (ma || params.n_batch.size() > 1 || params.n_batch != cmd_params_defaults.n_batch) {
             fields.emplace_back("n_batch");
         }
-        if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
+        if (ma || params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
             fields.emplace_back("n_ubatch");
         }
-        if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
+        if (ma || params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
             fields.emplace_back("type_k");
         }
-        if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
+        if (ma || params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
             fields.emplace_back("type_v");
         }
-        if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
+        if (ma || params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");
         }
-        if (params.split_mode.size() > 1 || params.split_mode != cmd_params_defaults.split_mode) {
+        if (ma || params.split_mode.size() > 1 || params.split_mode != cmd_params_defaults.split_mode) {
             fields.emplace_back("split_mode");
         }
-        if (params.no_kv_offload.size() > 1 || params.no_kv_offload != cmd_params_defaults.no_kv_offload) {
+        if (ma || params.no_kv_offload.size() > 1 || params.no_kv_offload != cmd_params_defaults.no_kv_offload) {
             fields.emplace_back("no_kv_offload");
         }
-        if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
+        if (ma || params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
         }
-        if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
+        if (ma || params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
             fields.emplace_back("devices");
         }
-        if (params.tensor_split.size() > 1 || params.tensor_split != cmd_params_defaults.tensor_split) {
+        if (ma || params.tensor_split.size() > 1 || params.tensor_split != cmd_params_defaults.tensor_split) {
             fields.emplace_back("tensor_split");
         }
-        if (params.tensor_buft_overrides.size() > 1 || !vec_vec_tensor_buft_override_equal(params.tensor_buft_overrides, cmd_params_defaults.tensor_buft_overrides)) {
+        if (ma || params.tensor_buft_overrides.size() > 1 || !vec_vec_tensor_buft_override_equal(params.tensor_buft_overrides, cmd_params_defaults.tensor_buft_overrides)) {
             fields.emplace_back("tensor_buft_overrides");
         }
-        if (params.use_mmap.size() > 1 || params.use_mmap != cmd_params_defaults.use_mmap) {
+        if (ma || params.use_mmap.size() > 1 || params.use_mmap != cmd_params_defaults.use_mmap) {
             fields.emplace_back("use_mmap");
         }
-        if (params.use_direct_io.size() > 1 || params.use_direct_io != cmd_params_defaults.use_direct_io) {
+        if (ma || params.use_direct_io.size() > 1 || params.use_direct_io != cmd_params_defaults.use_direct_io) {
             fields.emplace_back("use_direct_io");
         }
-        if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
+        if (ma || params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
         }
-        if (params.no_op_offload.size() > 1 || params.no_op_offload != cmd_params_defaults.no_op_offload) {
+        if (ma || params.no_op_offload.size() > 1 || params.no_op_offload != cmd_params_defaults.no_op_offload) {
             fields.emplace_back("no_op_offload");
         }
-        if (params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
+        if (ma || params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
             fields.emplace_back("no_host");
         }
+        fields.emplace_back("main_model");
+        fields.emplace_back("draft_model");
         fields.emplace_back("test");
         fields.emplace_back("t/s");
+        if (!params.spec_model.empty()) {
+            fields.emplace_back("spec_keep_ratio");
+            fields.emplace_back("spec_n_lookahead");
+            fields.emplace_back("spec_n_kept");
+            fields.emplace_back("meas_ttft_Sx");
+            fields.emplace_back("paper_ref_Sx");
+            fields.emplace_back("paper_ref_src");
+            fields.emplace_back("paper_Sx");
+        }
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
@@ -2077,6 +2266,41 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
+/// Same token RNG as spec_prefill_test_prompt / llama_spec_prefill (must match dense baseline).
+static void fill_spec_prefill_prompt_tokens(const llama_model * model, int n_prompt, std::vector<llama_token> & prompt_tokens) {
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    prompt_tokens.resize(n_prompt);
+    prompt_tokens[0] = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    for (int i = 1; i < n_prompt; i++) {
+        prompt_tokens[i] = std::rand() % n_vocab;
+    }
+}
+
+/// Dense prefill timed against spec-prefill: same llama_batch layout as llama_spec_prefill_process_base
+/// (see llama-spec-prefill.cpp) — avoids llama_batch_get_one path asymmetry on split-GPU CUDA.
+static bool test_dense_prefill_like_process_base(llama_context * ctx, const llama_token * tokens, int n_prompt, int n_threads) {
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+    batch.n_tokens    = 0;
+
+    for (int i = 0; i < n_prompt; i++) {
+        batch.token[batch.n_tokens]     = tokens[i];
+        batch.pos[batch.n_tokens]       = i;
+        batch.n_seq_id[batch.n_tokens]  = 1;
+        batch.seq_id[batch.n_tokens][0] = 0;
+        batch.logits[batch.n_tokens]    = (i == n_prompt - 1);
+        batch.n_tokens++;
+    }
+
+    const int res = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    llama_synchronize(ctx);
+    return res == 0;
+}
+
 static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
@@ -2129,8 +2353,9 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
 static bool spec_prefill_test_prompt(
     llama_context * ctx_base,
-    llama_model * lmodel_spec,
+    llama_model * /* lmodel_spec */,
     llama_context * & ctx_spec,
+    const std::vector<llama_token> & prompt_tokens,
     int n_prompt,
     int n_lookahead,
     float keep_ratio,
@@ -2139,16 +2364,7 @@ static bool spec_prefill_test_prompt(
     std::vector<uint64_t> & samples_ttft_ns,
     int & spec_n_kept_out) {
 
-    const llama_model * model   = llama_get_model(ctx_base);
-    const llama_vocab * vocab   = llama_model_get_vocab(model);
-    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
-
-    // Generate random prompt tokens
-    std::vector<llama_token> prompt_tokens(n_prompt);
-    prompt_tokens[0] = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
-    for (int i = 1; i < n_prompt; i++) {
-        prompt_tokens[i] = std::rand() % n_vocab;
-    }
+    GGML_ASSERT((int)prompt_tokens.size() == n_prompt);
 
     llama_spec_prefill_params spec_params;
     spec_params.keep_ratio     = keep_ratio;
@@ -2164,7 +2380,8 @@ static bool spec_prefill_test_prompt(
     }
 
     bool ok = true;
-    for (int r = 0; r < 3; r++) {
+    // One timed pass per outer llama-bench repetition (-r); outer loop already aggregates variance.
+    for (int r = 0; r < 1; r++) {
         llama_memory_clear(llama_get_memory(ctx_base), false);
         uint64_t t_start = get_time_ns();
         int n_kept = llama_spec_prefill(spec_ctx, prompt_tokens.data(), n_prompt, n_lookahead, keep_ratio);
@@ -2316,20 +2533,32 @@ int main(int argc, char ** argv) {
             }
         }
 
-         llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
+        // Effective cparams: when spec-prefill is active, size n_ctx/n_batch up front so
+        // the same ctx survives the whole rep loop. Avoids destroying+recreating ctx
+        // per rep, which previously poisoned the dense baseline with cold-context cost
+        // (compute-buffer alloc, CUDA-graph capture, cuBLAS handle init) on every rep
+        // while the spec run reused the now-warm ctx.
+        llama_context_params eff_cparams = inst.to_llama_cparams();
+        if (!inst.spec_model.empty()) {
+            eff_cparams.n_ctx  += inst.spec_n_lookahead + 64;
+            eff_cparams.n_batch = (uint32_t)std::max((int)eff_cparams.n_batch, inst.n_prompt + inst.spec_n_lookahead);
+        }
+        llama_context * ctx = llama_init_from_model(lmodel, eff_cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_model_free(lmodel);
             return 1;
         }
 
-       if (!inst.spec_model.empty() && ctx_spec == nullptr) {
-            {
-                llama_context_params sp_cparams = inst.to_llama_cparams();
-                sp_cparams.n_ctx += inst.spec_n_lookahead + 64;
-                sp_cparams.n_batch = (uint32_t)std::max((int)sp_cparams.n_batch, inst.n_prompt + inst.spec_n_lookahead);
-                ctx_spec = llama_init_from_model(lmodel_spec, sp_cparams);
+        // Always (re)create ctx_spec per instance: n_batch in eff_cparams depends on
+        // inst.n_prompt, so a ctx_spec carried over from a previous instance with a
+        // different prompt length would have the wrong batch sizing.
+        if (!inst.spec_model.empty()) {
+            if (ctx_spec) {
+                llama_free(ctx_spec);
+                ctx_spec = nullptr;
             }
+            ctx_spec = llama_init_from_model(lmodel_spec, eff_cparams);
             if (ctx_spec == NULL) {
                 fprintf(stderr, "%s: error: failed to create spec context\n", __func__);
                 llama_free(ctx);
@@ -2374,8 +2603,14 @@ int main(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
-                //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = false;
+                if (!inst.spec_model.empty()) {
+                    std::vector<llama_token> wtok;
+                    fill_spec_prefill_prompt_tokens(lmodel, t.n_prompt, wtok);
+                    res = test_dense_prefill_like_process_base(ctx, wtok.data(), t.n_prompt, t.n_threads);
+                } else {
+                    res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                }
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
@@ -2394,6 +2629,20 @@ int main(int argc, char ** argv) {
                     llama_model_free(lmodel);
                     exit(1);
                 }
+            }
+            if (!inst.spec_model.empty() && t.n_prompt > 0 && ctx_spec != nullptr) {
+                if (params.progress) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup spec prompt run\n", params_idx, params_count);
+                }
+                bool res = test_prompt(ctx_spec, t.n_prompt, t.n_batch, t.n_threads);
+                if (!res) {
+                    fprintf(stderr, "%s: error: failed to run spec prompt warmup\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                llama_memory_clear(llama_get_memory(ctx_spec), false);
+                llama_memory_clear(llama_get_memory(ctx), false);
             }
         }
 
@@ -2437,14 +2686,19 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            uint64_t t_start = get_time_ns();
+            uint64_t t_start = 0;
+            bool     have_timer = false;
 
             if (t.n_prompt > 0 && t.spec_model.empty()) {
+                if (!have_timer) {
+                    t_start    = get_time_ns();
+                    have_timer = true;
+                }
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
@@ -2453,6 +2707,10 @@ int main(int argc, char ** argv) {
                 }
             }
             if (t.n_gen > 0 && t.spec_model.empty()) {
+                if (!have_timer) {
+                    t_start    = get_time_ns();
+                    have_timer = true;
+                }
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
@@ -2464,50 +2722,71 @@ int main(int argc, char ** argv) {
                     llama_model_free(lmodel);
                     exit(1);
                 }
-            } else if (!t.spec_model.empty()) {
-                // Spec-prefill runs only when n_gen==0 (pp-only test).
-                // It needs a fresh context since it internally decodes the filtered tokens.
-                // Extra context for lookahead generation.
-                llama_context_params sp_cparams = inst.to_llama_cparams();
-                sp_cparams.n_ctx += inst.spec_n_lookahead + 64;
-                sp_cparams.n_batch = (uint32_t)std::max((int)sp_cparams.n_batch, inst.n_prompt + inst.spec_n_lookahead);
-                llama_free(ctx);
-                ctx = llama_init_from_model(lmodel, sp_cparams);
-                if (ctx == NULL) {
-                    fprintf(stderr, "%s: error: failed to create context for spec-prefill\n", __func__);
-                    llama_model_free(lmodel);
-                    exit(1);
+            } else if (!t.spec_model.empty() && t.n_prompt > 0 && t.n_gen == 0) {
+                // Spec-prefill: pp-only (n_gen must be 0). ctx and ctx_spec were created
+                // (and warmed) once per instance above; here we only reset KV state so
+                // dense and spec runs both start from a clean cache on a warm context.
+                llama_attach_threadpool(ctx_spec, threadpool, NULL);
+
+                // Paper TTFT speedup (arXiv:2502.02789 §4 / Fig. 3): dense full-prompt prefill / spec-prefill.
+                llama_memory_clear(llama_get_memory(ctx), false);
+                llama_memory_clear(llama_get_memory(ctx_spec), false);
+
+                // Same random prompt tokens and same llama_batch layout as llama_spec_prefill_process_base
+                // so dense/spec timings are comparable on split-GPU (avoids llama_batch_get_one path).
+                std::vector<llama_token> sp_prompt_tokens;
+                fill_spec_prefill_prompt_tokens(lmodel, t.n_prompt, sp_prompt_tokens);
+
+                if (params.progress) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: dense pp baseline %d/%d\n", params_idx, params_count,
+                            i + 1, params.reps);
                 }
-                llama_free(ctx_spec);
-                ctx_spec = llama_init_from_model(lmodel_spec, sp_cparams);
-                if (ctx_spec == NULL) {
-                    fprintf(stderr, "%s: error: failed to recreate spec context\n", __func__);
+                uint64_t t_dense_start = get_time_ns();
+                bool     res_dense =
+                    test_dense_prefill_like_process_base(ctx, sp_prompt_tokens.data(), t.n_prompt, t.n_threads);
+                uint64_t dense_ns      = get_time_ns() - t_dense_start;
+                if (!res_dense) {
+                    fprintf(stderr, "%s: error: failed dense prefill baseline for meas_ttft_Sx\n", __func__);
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     exit(1);
                 }
+
+                llama_memory_clear(llama_get_memory(ctx), false);
+                llama_memory_clear(llama_get_memory(ctx_spec), false);
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: spec-prefill run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
                 int spec_n_kept = 0;
+                t_start         = get_time_ns();
+                have_timer      = true;
                 bool spec_ok = spec_prefill_test_prompt(
                     ctx, lmodel_spec, ctx_spec,
+                    sp_prompt_tokens,
                     t.n_prompt, t.spec_n_lookahead, t.spec_keep_ratio,
                     inst.spec_pool, inst.spec_chunk_size, t.samples_ttft_ns, spec_n_kept);
+                llama_synchronize(ctx);
+                llama_synchronize(ctx_spec);
+                uint64_t spec_only_ns = get_time_ns() - t_start;
                 if (!spec_ok) {
                     fprintf(stderr, "%s: error: failed to run spec-prefill\n", __func__);
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     exit(1);
                 }
+                if (dense_ns > 0 && spec_only_ns > 0) {
+                    t.samples_meas_ttft_Sx.push_back((double) dense_ns / (double) spec_only_ns);
+                }
                 if (i == 0) {
                     t.spec_n_kept = spec_n_kept;
                 }
             }
 
-            uint64_t t_ns = get_time_ns() - t_start;
-            t.samples_ns.push_back(t_ns);
+            if (have_timer) {
+                uint64_t t_ns = get_time_ns() - t_start;
+                t.samples_ns.push_back(t_ns);
+            }
         }
 
         if (p) {

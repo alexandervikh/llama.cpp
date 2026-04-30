@@ -136,6 +136,8 @@ These are research extensions beyond the paper's evaluated scope. Treat results 
 
 ## Execution Order (suggested)
 
+0. **Automated bundle (optional):** `python3 tools/paper_compare_spec_prefill.py --all --build-dir <build> --base <8B.gguf> --draft <1B.gguf> -o <out>` — runs ctest, determinism, parity mock, LongBench driver + score, TTFT bench; see `SPEC_PREFILL_PAPER_COMPARE.md`.
+
 1. §2 (unit + Q-tensor + lookahead-init regression) — get CI green.
 2. §2.5 (quality sanity gate on canonical pair) — cheap go/no-go.
 3. §4 TTFT sweep on canonical pair, GPU — confirm speedup claim on our hardware.

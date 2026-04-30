@@ -14,6 +14,19 @@ def main():
     ap.add_argument("--n-per-task", type=int, default=20, help="Prompts per task")
     ap.add_argument("--extra", nargs="*", default=[], help="Extra args to driver")
     ap.add_argument("--synthetic", action="store_true", help="Use synthetic prompts if LongBench unavailable")
+    ap.add_argument(
+        "--gpu-layers",
+        "-ngl",
+        type=int,
+        default=int(os.environ.get("SPEC_PREFILL_GPU_LAYERS", "0")),
+        help="Forward -ngl to llama-spec-prefill-run (CUDA offload)",
+    )
+    ap.add_argument(
+        "--tasks",
+        nargs="*",
+        default=None,
+        help="Subset of LongBench task names (default: all preset tasks)",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -46,7 +59,8 @@ def main():
 
     results_summary = []
 
-    for task in TASKS:
+    tasks = args.tasks if args.tasks else TASKS
+    for task in tasks:
         print(f"\n=== Task: {task} ===")
         rows = try_load_task(task)
         if rows is None:
@@ -71,6 +85,8 @@ def main():
                 "--prompt-file", prompts_path,
                 "--out", out_path,
             ] + list(args.extra)
+            if args.gpu_layers and args.gpu_layers > 0:
+                cmd += ["-ngl", str(args.gpu_layers)]
             print(f"  Running kr={kr}... ", end="", flush=True)
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -92,7 +108,7 @@ def main():
     ok = sum(1 for r in results_summary if r["status"] == "ok")
     total = len(results_summary)
     print(f"\nCompleted: {ok}/{total} runs succeeded")
-    expected = len(TASKS) * len(args.keep_ratios)
+    expected = len(tasks) * len(args.keep_ratios)
     if ok == expected:
         print(f"PASS: all {expected} output files created")
     else:
