@@ -60,6 +60,9 @@ def parse_args():
                    help="Output directory for reports")
     p.add_argument("--decode-pruning", action="store_true",
                    help="Enable Phase 5 decode KV pruning in binary runs")
+    p.add_argument("--truncation", choices=["tail", "middle"], default="middle",
+                   help="Truncation mode for long prompts: tail (keep end) or "
+                        "middle (keep head+tail, LongBench paper convention). Default: middle")
     return p.parse_args()
 
 
@@ -126,7 +129,8 @@ def gen_prompt(n_words: int) -> str:
 
 def run_binary(binary: str, model: str, prompt: str, pruning_layers: list,
                keep_ratios: list, pool_size: int, repeat: int, n_ctx: int,
-               decode_pruning: bool = False) -> dict:
+               decode_pruning: bool = False,
+               truncation: str = "tail") -> dict:
     """Run llama-lazyllm-run binary and parse results."""
     cmd = [
         binary,
@@ -137,6 +141,7 @@ def run_binary(binary: str, model: str, prompt: str, pruning_layers: list,
         "--pool-size", str(pool_size),
         "--repeat", str(repeat),
         "--n-ctx", str(n_ctx),
+        "--truncation", truncation,
     ]
     if decode_pruning:
         cmd.append("--decode-pruning")
@@ -201,6 +206,7 @@ def mode_ttft(args):
             args.pruning_layers, args.keep_ratios,
             args.pool_size, args.repeat, n_ctx,
             decode_pruning=args.decode_pruning,
+            truncation=args.truncation,
         )
 
         if "error" in data:

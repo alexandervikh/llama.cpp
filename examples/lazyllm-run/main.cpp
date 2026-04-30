@@ -105,6 +105,10 @@ struct Args {
     int      n_prompts        = -1;   // max prompts to evaluate (-1 = all)
     bool     verbose          = false;
     bool     no_fa            = false; // disable flash attention (for debugging)
+    // Truncation mode when prompt exceeds n_ctx - max_tokens:
+    //   "tail"   — drop from the front, keeping the end (question last) [old default]
+    //   "middle" — drop from the middle, keeping head+tail (LongBench convention)
+    std::string truncation    = "tail";
 };
 
 static void print_usage(const char * prog) {
@@ -126,6 +130,8 @@ static void print_usage(const char * prog) {
         << "  --decode-pruning           enable Phase 5 decode KV pruning\n"
         << "  --decode-keep-ratio 0.7    (default: 0.7)\n"
         << "  --no-flash-attn            disable flash attention (default: enabled)\n"
+        << "  --truncation tail|middle   tail: drop head (LongBench default for Q-at-end prompts)\n"
+        << "                             middle: drop middle, keep head+tail (paper convention)\n"
         << "  --verbose                  verbose logging\n";
 }
 
@@ -151,8 +157,15 @@ static bool parse_args(int argc, char ** argv, Args & a) {
         } else if (arg == "--keep-ratios") {
             a.keep_ratios.clear();
             while (i + 1 < argc && argv[i+1][0] != '-') a.keep_ratios.push_back(std::stof(argv[++i]));
-        } else if (arg == "--no-flash-attn")              { a.no_fa = true; }
-        else {
+        }         else if (arg == "--no-flash-attn")              { a.no_fa = true; }
+        else if (arg == "--truncation" && i + 1 < argc) {
+            a.truncation = argv[++i];
+            if (a.truncation != "tail" && a.truncation != "middle") {
+                std::cerr << "Unknown truncation mode: " << a.truncation
+                          << " (valid: tail, middle)\n";
+                return false;
+            }
+        } else {
             std::cerr << "Unknown arg: " << arg << "\n";
             return false;
         }
@@ -383,22 +396,17 @@ static PromptResult bench_prompt(
                 // Sample first token from lazyllm logits (final decode_partial).
                 llama_token first = sample_greedy(ctx, vocab);
 
-                // Build full-model KV on kept tokens for correct generation.
-                const auto & kept_idx = lz_ctx->kept_indices;
-                std::vector<llama_token> kept_tokens;
-                kept_tokens.reserve(kept_idx.size());
-                for (int32_t ki : kept_idx) {
-                    if (ki >= 0 && ki < (int32_t)tokens.size())
-                        kept_tokens.push_back(tokens[(size_t)ki]);
+                // After llama_lazyllm_prefill the KV cache already contains the
+                // kept tokens at their ORIGINAL positions.  alive_positions holds
+                // the last original position so we can continue generation from
+                // the correct point.  No need to rebuild KV — just generate.
+                llama_pos next_pos = (llama_pos)tokens.size(); // default: after all tokens
+                if (!lz_ctx->alive_positions.empty()) {
+                    next_pos = lz_ctx->alive_positions.back() + 1;
                 }
-                llama_memory_clear(llama_get_memory(ctx), false);
-                llama_batch kb = llama_batch_get_one(
-                    kept_tokens.data(), (int32_t)kept_tokens.size());
-                if (llama_decode(ctx, kb) == 0) {
-                    res.lazyllm_output = generate_tokens(ctx, lz_ctx, vocab, first,
-                                                         (llama_pos)kept_tokens.size(), max_tokens,
-                                                         0, &res.lazyllm_tpot_ms);
-                }
+                res.lazyllm_output = generate_tokens(ctx, lz_ctx, vocab, first,
+                                                     next_pos, max_tokens,
+                                                     0, &res.lazyllm_tpot_ms);
             }
             llama_lazyllm_free(lz_ctx);
         }
@@ -514,12 +522,26 @@ int main(int argc, char ** argv) {
             // Truncate to n_ctx - max_tokens so generation tokens fit within KV.
             // Position n_prompt is where the first generated token goes; it must
             // be < n_ctx for the KV cache (positions 0..n_ctx-1 are valid).
-            // LongBench puts the QUESTION at the END of the prompt, so we use
-            // TAIL truncation: keep the last max_prompt tokens, preserving the
-            // question. This discards the beginning of the context passages.
             const int max_prompt = (int)args.n_ctx - std::max(args.max_tokens, 1);
             if (n_prompt > max_prompt) {
-                tokens.erase(tokens.begin(), tokens.begin() + (n_prompt - max_prompt));
+                if (args.truncation == "middle") {
+                    // Middle truncation (LongBench / paper convention):
+                    // keep the first half and the last half, discard the middle.
+                    // This preserves both the task instruction (typically at the
+                    // head) and the question (typically at the tail).
+                    const int keep_head = max_prompt / 2;
+                    const int keep_tail = max_prompt - keep_head;
+                    std::vector<llama_token> trunc;
+                    trunc.reserve((size_t)max_prompt);
+                    trunc.insert(trunc.end(), tokens.begin(), tokens.begin() + keep_head);
+                    trunc.insert(trunc.end(), tokens.end() - keep_tail, tokens.end());
+                    tokens = std::move(trunc);
+                } else {
+                    // Tail truncation (default): drop from the front, keeping the
+                    // end.  LongBench puts the question at the end of the prompt,
+                    // so this preserves it while discarding beginning of context.
+                    tokens.erase(tokens.begin(), tokens.begin() + (n_prompt - max_prompt));
+                }
                 n_prompt = max_prompt;
             }
 

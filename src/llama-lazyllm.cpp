@@ -343,15 +343,17 @@ std::vector<int32_t> llama_lazyllm_top_k_indices(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: build a batch from a subset of tokens
+// Helper: build a batch from a subset of tokens at their ORIGINAL positions
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// NOTE: token batches (build_filtered_batch, fallback path) still use
-// sequential positions 0..n_kept-1 because the KV-cache continuity check
-// requires contiguous positions for token batches.  The primary embedding-
-// injection path (build_embd_batch) uses original positions; the contiguity
-// check is bypassed for embedding batches in llama-batch.cpp.
-
+// After llama_memory_clear the KV cache is empty, so seq_pos_max(s) == -1.
+// llama-batch.cpp's within-batch gap check is conditioned on `p0 >= 0`, so it
+// is skipped when the cache is clear — making non-contiguous original positions
+// safe to use here without an embedding batch.
+//
+// Using original positions is essential for RoPE correctness: a kept token at
+// original position 2048 must receive RoPE frequencies for position 2048, not
+// for whatever sequential slot it occupies in the pruned set.
 static llama_batch build_filtered_batch(
         const llama_batch & src,
         const std::vector<int32_t> & keep_token_indices) {
@@ -362,11 +364,12 @@ static llama_batch build_filtered_batch(
     for (int32_t idx : keep_token_indices) {
         if (idx < 0 || idx >= src.n_tokens) continue;
         dst.token[dst.n_tokens]    = src.token ? src.token[idx] : 0;
-        // Token batches (batch.embd == nullptr) still require contiguous
-        // positions for the KV-cache continuity check. This fallback path
-        // uses sequential 0..n_kept-1; the main embedding-injection path uses
-        // original positions (see build_embd_batch).
-        dst.pos[dst.n_tokens]      = (llama_pos)dst.n_tokens;
+        // Use ORIGINAL position from the source batch so that RoPE is applied
+        // at the correct frequency for each kept token.  The within-batch gap
+        // check in llama-batch.cpp is skipped when the KV cache is cleared
+        // (seq_pos_max returns -1), so non-contiguous original positions are
+        // safe here.  This function must only be called after llama_memory_clear.
+        dst.pos[dst.n_tokens]      = src.pos ? src.pos[idx] : (llama_pos)idx;
         dst.n_seq_id[dst.n_tokens] = src.n_seq_id ? src.n_seq_id[idx] : 1;
         if (src.seq_id && src.n_seq_id) {
             for (int s = 0; s < src.n_seq_id[idx]; s++) {

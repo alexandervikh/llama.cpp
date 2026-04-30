@@ -269,11 +269,21 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 unset(LLAMA_TEST_NAME)
 llama_build(test-self-layer-prefill.cpp)
 target_include_directories(test-self-layer-prefill PRIVATE ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-self-layer-prefill LABEL lazyllm)
 
-# LazyLLM unit tests
+# LazyLLM unit tests — ctest -L lazyllm runs all of these
 unset(LLAMA_TEST_NAME)
 llama_build(test-lazyllm-extract.cpp)
 target_include_directories(test-lazyllm-extract PRIVATE ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-lazyllm-extract LABEL lazyllm)
+
+llama_build(test-lazyllm-pool.cpp)
+target_include_directories(test-lazyllm-pool PRIVATE ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-lazyllm-pool LABEL lazyllm)
+
+llama_build(test-lazyllm-topk.cpp)
+target_include_directories(test-lazyllm-topk PRIVATE ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-lazyllm-topk LABEL lazyllm)
 
 # Speculative prefill POC tests
 unset(LLAMA_TEST_NAME)

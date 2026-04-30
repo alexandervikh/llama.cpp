@@ -317,7 +317,11 @@ bool llama_batch_allocr::init(
                 }
             }
 
-            if (!batch.embd && seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
+            // Skip the within-batch gap check when the KV cache is empty for this sequence
+            // (p0 == -1 means cleared or never written).  LazyLLM's fallback path resets
+            // the KV cache and re-decodes kept tokens at their ORIGINAL (non-contiguous)
+            // positions, which is correct for RoPE but would otherwise trip this check.
+            if (!batch.embd && p0 >= 0 && seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
                 LLAMA_LOG_ERROR("%s: sequence %d positions are not continuous\n", __func__, s);
                 return false;
             }
