@@ -42,7 +42,7 @@ def parse_args():
         description="LazyLLM Phase 6 evaluation harness",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--mode", choices=["ttft", "quality", "longbench"], default="ttft")
+    p.add_argument("--mode", choices=["ttft", "quality", "longbench", "mcq-logits"], default="ttft")
     p.add_argument("--model", help="Path to GGUF model file (for TTFT mode)")
     p.add_argument("--model-hf", help="HuggingFace model path (for quality/longbench modes)")
     p.add_argument("--binary", default="./build/bin/llama-lazyllm-run",
@@ -63,6 +63,10 @@ def parse_args():
     p.add_argument("--truncation", choices=["tail", "middle"], default="middle",
                    help="Truncation mode for long prompts: tail (keep end) or "
                         "middle (keep head+tail, LongBench paper convention). Default: middle")
+    # mcq-logits mode
+    p.add_argument("--mcq-file", help="JSONL file with MCQ examples for mcq-logits mode")
+    p.add_argument("--mcq-n-examples", type=int, default=500)
+    p.add_argument("--mcq-n-ctx", type=int, default=2048)
     return p.parse_args()
 
 
@@ -543,6 +547,148 @@ def _generate_lazyllm(model, tokenizer, prompt: str,
         return _generate_baseline(model, tokenizer, prompt, max_new_tokens)
 
 
+# ─── mcq-logits mode ──────────────────────────────────────────────────────────
+
+OPTIONS = ["A", "B", "C", "D"]
+
+
+def _run_mcq_generation(binary: str, model: str, prompt: str,
+                         pruning_layers: list, keep_ratios: list,
+                         n_ctx: int, mode: str = "baseline") -> int | None:
+    """Run binary with max_new_tokens=4 and extract option letter from output."""
+    import re as _re
+    kr = [1.0] * len(pruning_layers) if mode == "baseline" else keep_ratios
+    cmd = [
+        binary,
+        "--model", model,
+        "--prompt", prompt,
+        "--pruning-layers", *[str(l) for l in pruning_layers],
+        "--keep-ratios", *[str(r) for r in kr],
+        "--n-ctx", str(n_ctx),
+        "--max-new-tokens", "4",
+        "--no-warmup",
+        "--no-bench",
+    ]
+    try:
+        import subprocess as _sp
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=60)
+        output = result.stdout + result.stderr
+        for line in output.splitlines():
+            if line.startswith("Generated:"):
+                gen = line[len("Generated:"):].strip().upper()
+                for i, opt in enumerate(OPTIONS):
+                    if gen.startswith(opt):
+                        return i
+    except Exception:
+        pass
+    return None
+
+
+def mode_mcq_logits(args):
+    """
+    MCQ (multiple-choice) evaluation using generation.
+
+    Input: JSONL file where each line is:
+      {"question": "...", "choices": ["A text", "B text", "C text", "D text"], "answer": 0}
+
+    Evaluates accuracy of baseline and LazyLLM by generating one letter token
+    and checking it against the gold answer index.
+
+    Reports accuracy delta. Gate: |delta| <= 2 pp.
+    """
+    if not args.model:
+        print("ERROR: --model required for mcq-logits mode", file=sys.stderr)
+        sys.exit(1)
+    if not args.mcq_file:
+        print("ERROR: --mcq-file required for mcq-logits mode", file=sys.stderr)
+        sys.exit(1)
+
+    from pathlib import Path as _Path
+    import json as _json
+
+    examples = []
+    with open(args.mcq_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                examples.append(_json.loads(line))
+    if args.mcq_n_examples:
+        examples = examples[:args.mcq_n_examples]
+
+    FEW_SHOT = (
+        "The following are multiple choice questions (with answers).\n\n"
+        "Question: Which planet is closest to the Sun?\n"
+        "A. Earth\nB. Venus\nC. Mercury\nD. Mars\nAnswer: C\n\n"
+    )
+
+    bl_correct = 0
+    lz_correct = 0
+    n = len(examples)
+
+    print(f"=== LazyLLM MCQ Evaluation ===")
+    print(f"Model:   {os.path.basename(args.model)}")
+    print(f"File:    {args.mcq_file}  ({n} examples)")
+    print(f"Config:  layers={args.pruning_layers} ratios={args.keep_ratios}")
+    print()
+
+    for i, ex in enumerate(examples):
+        choices = ex.get("choices", [])
+        if len(choices) < 4:
+            continue
+        prompt = (FEW_SHOT +
+                  f"Question: {ex['question']}\n"
+                  f"A. {choices[0]}\nB. {choices[1]}\nC. {choices[2]}\nD. {choices[3]}\n"
+                  "Answer:")
+        gold = ex.get("answer", 0)
+
+        print(f"  [{i+1}/{n}] {ex['question'][:55]}...", end=" ", flush=True)
+
+        bl_pred = _run_mcq_generation(
+            args.binary, args.model, prompt,
+            args.pruning_layers, args.keep_ratios, args.mcq_n_ctx, mode="baseline")
+        lz_pred = _run_mcq_generation(
+            args.binary, args.model, prompt,
+            args.pruning_layers, args.keep_ratios, args.mcq_n_ctx, mode="lazyllm")
+
+        bl_ok = bl_pred == gold
+        lz_ok = lz_pred == gold
+        if bl_ok:
+            bl_correct += 1
+        if lz_ok:
+            lz_correct += 1
+
+        bl_letter = OPTIONS[bl_pred] if bl_pred is not None else "?"
+        lz_letter = OPTIONS[lz_pred] if lz_pred is not None else "?"
+        print(f"gold={OPTIONS[gold]} bl={bl_letter}({'✓' if bl_ok else '✗'}) "
+              f"lz={lz_letter}({'✓' if lz_ok else '✗'})")
+
+    if n > 0:
+        bl_acc = bl_correct / n
+        lz_acc = lz_correct / n
+        delta  = lz_acc - bl_acc
+        gate   = abs(delta) <= 0.02
+
+        print(f"\nBaseline accuracy: {bl_acc:.1%} ({bl_correct}/{n})")
+        print(f"LazyLLM accuracy:  {lz_acc:.1%} ({lz_correct}/{n})")
+        print(f"Delta:             {delta:+.1%}")
+        print(f"Gate (|delta| ≤ 2 pp): {'PASS ✅' if gate else 'FAIL ❌'}")
+
+        os.makedirs(args.out_dir, exist_ok=True)
+        from datetime import datetime as _dt
+        date = _dt.now().strftime("%Y%m%d-%H%M%S")
+        report_path = os.path.join(args.out_dir, f"lazyllm-mcq-{date}.md")
+        with open(report_path, "w") as f:
+            f.write("# LazyLLM MCQ Evaluation Report\n\n")
+            f.write(f"Date: {_dt.now().isoformat()}\n")
+            f.write(f"Model: {os.path.basename(args.model)}\n")
+            f.write(f"File: {args.mcq_file}, n={n}\n\n")
+            f.write("| Metric | Baseline | LazyLLM | Delta |\n")
+            f.write("|--------|----------|---------|-------|\n")
+            f.write(f"| Accuracy | {bl_acc:.1%} | {lz_acc:.1%} | {delta:+.1%} |\n\n")
+            f.write(f"**Gate (|delta| ≤ 2 pp)**: {'PASS ✅' if gate else 'FAIL ❌'}\n")
+        print(f"\nReport saved to: {report_path}")
+
+
 # ─── entrypoint ───────────────────────────────────────────────────────────────
 
 def main():
@@ -553,6 +699,8 @@ def main():
         mode_quality(args)
     elif args.mode == "longbench":
         mode_longbench(args)
+    elif args.mode == "mcq-logits":
+        mode_mcq_logits(args)
 
 
 if __name__ == "__main__":

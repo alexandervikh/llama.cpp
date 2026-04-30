@@ -285,6 +285,18 @@ llama_build(test-lazyllm-topk.cpp)
 target_include_directories(test-lazyllm-topk PRIVATE ${PROJECT_SOURCE_DIR}/include)
 llama_test(test-lazyllm-topk LABEL lazyllm)
 
+llama_build(test-lazyllm-identity-kr1.cpp)
+target_include_directories(test-lazyllm-identity-kr1 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-lazyllm-identity-kr1 LABEL lazyllm)
+
+llama_build(test-lazyllm-rope-positions.cpp)
+target_include_directories(test-lazyllm-rope-positions PRIVATE ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-lazyllm-rope-positions LABEL lazyllm)
+
+llama_build(test-lazyllm-fallback.cpp)
+target_include_directories(test-lazyllm-fallback PRIVATE ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-lazyllm-fallback LABEL lazyllm)
+
 # Speculative prefill POC tests
 unset(LLAMA_TEST_NAME)
 llama_build(test-spec-prefill.cpp)
